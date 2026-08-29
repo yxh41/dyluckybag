@@ -1,0 +1,13 @@
+Package: com.yxh41.dyluckybag
+Name: Douyin Lucky Bag Helper
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Auto-detect and join Douyin live-stream lucky bags (OCR based)
+ Uses on-device screen capture + Vision OCR to find lucky bag prompts and
+ tap the join button. No Douyin class hooks, so it survives app updates far
+ better than selector-based tweaks.
+Maintainer: yxh41
+Author: yxh41
+Homepage: https://github.com/yxh41/dyluckybag
+Section: Tweaks
+Depends: ellekit | mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)

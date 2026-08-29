@@ -1,0 +1,10 @@
+.theos/
+packages/
+build.log
+*.deb
+*.dSYM/
+theos/
+out-rel/
+out-dbg/
+artifacts/
+.DS_Store

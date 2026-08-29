@@ -1,0 +1,89 @@
+name: Build DYLuckyBag (rootless)
+
+# Only build the dev branch. Pushing artifacts to ci-artifacts does NOT retrigger
+# this workflow (ci-artifacts is excluded), avoiding a publish -> build loop.
+permissions:
+  contents: write   # needed to force-push the .deb / build.log to ci-artifacts
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: "${{ github.workspace }}/theos"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: brew install dpkg ldid
+
+      # Clone + build in ONE step so build.log always captures the failure,
+      # even if the theos clone itself fails.
+      - name: Clone Theos + SDK and build
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          exec > >(tee build.log) 2>&1
+          set -x
+          echo "== cloning theos =="
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          rm -rf "$THEOS/sdks"
+          git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          git -C "$THEOS/sdks" sparse-checkout set iPhoneOS16.5.sdk
+          echo "== building RELEASE (DYLog compiled out) =="
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          mkdir -p out-rel && cp packages/*.deb out-rel/DYLuckyBag.deb
+          echo "== building DEBUG (DYLog + file sink, for field diagnosis) =="
+          make clean
+          rm -rf packages
+          make package DEBUG=1 THEOS_PACKAGE_SCHEME=rootless
+          mkdir -p out-dbg && cp packages/*.deb out-dbg/DYLuckyBag-debug.deb
+
+      - name: Publish artifacts to ci-artifacts branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.email "ci@local"
+          git config user.name "CI"
+          mkdir -p artifacts
+          if [ -f build.log ]; then cp build.log artifacts/ci-last-build.log; fi
+          if [ -f out-rel/DYLuckyBag.deb ]; then cp out-rel/DYLuckyBag.deb artifacts/DYLuckyBag.deb; fi
+          if [ -f out-dbg/DYLuckyBag-debug.deb ]; then cp out-dbg/DYLuckyBag-debug.deb artifacts/DYLuckyBag-debug.deb; fi
+          if [ -f artifacts/ci-last-build.log ] || ls artifacts/*.deb >/dev/null 2>&1; then
+            # .gitignore contains "*.deb", so the .deb must be force-added or it
+            # is silently skipped and never reaches ci-artifacts (learned the
+            # hard way on the NextUp3 build).
+            git add -A -f artifacts
+            git commit -m "ci artifacts (${{ github.sha }})" || echo "nothing to commit"
+            git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts
+          else
+            echo "no artifacts produced; nothing to publish"
+          fi
+
+      # The build step uses continue-on-error so it always emits a log; this
+      # step makes the run's conclusion reflect whether a .deb actually came out.
+      - name: Verify .deb produced
+        if: always()
+        run: |
+          ok=1
+          if [ -f out-rel/DYLuckyBag.deb ]; then
+            echo "BUILD OK (release): $(ls -l out-rel/DYLuckyBag.deb)"
+          else
+            echo "BUILD FAILED: no release .deb"
+            ok=0
+          fi
+          if [ -f out-dbg/DYLuckyBag-debug.deb ]; then
+            echo "BUILD OK (debug): $(ls -l out-dbg/DYLuckyBag-debug.deb)"
+          else
+            echo "BUILD FAILED: no debug .deb"
+            ok=0
+          fi
+          [ "$ok" = "1" ] || exit 1
