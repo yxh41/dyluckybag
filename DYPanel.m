@@ -66,12 +66,17 @@ static const CGFloat kPanelHeight = 420.0;
 }
 
 - (void)refresh {
+    __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
         DYConfig *config = [DYConfig shared];
-        self.statusLabel.text = [DYEngine shared].lastStatus ?: @"—";
-        self.joinLabel.text = @(config.todayJoinCount).stringValue;
-        self.winLabel.text = @(config.todayWinCount).stringValue;
-        self.roomLabel.text = @(config.todayRoomCount).stringValue;
+        strongSelf.statusLabel.text = [DYEngine shared].lastStatus ?: @"—";
+        strongSelf.joinLabel.text = @(config.todayJoinCount).stringValue;
+        strongSelf.winLabel.text = @(config.todayWinCount).stringValue;
+        strongSelf.roomLabel.text = @(config.todayRoomCount).stringValue;
     });
 }
 
@@ -125,7 +130,9 @@ static const CGFloat kPanelHeight = 420.0;
      object:nil];
 }
 
-- (UIWindowScene *)activeWindowScene API_AVAILABLE(ios(13.0)) {
+// No availability attribute needed: the deployment target is iOS 15, so
+// UIWindowScene and -initWithWindowScene: are always present.
+- (UIWindowScene *)activeWindowScene {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive &&
             [scene isKindOfClass:UIWindowScene.class]) {
@@ -413,16 +420,28 @@ static const CGFloat kPanelHeight = 420.0;
         return;
     }
     SEL setter = NSSelectorFromString(setterName);
-    if (![[DYConfig shared] respondsToSelector:setter]) {
+    DYConfig *config = [DYConfig shared];
+    if (![config respondsToSelector:setter]) {
         return;
     }
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    [[DYConfig shared] performSelector:setter withObject:@(sender.on)];
-#pragma clang diagnostic pop
+    // NSInvocation rather than performSelector:withObject: — the latter boxes
+    // the BOOL into an NSNumber, but a BOOL setter reads the raw argument
+    // register, so it would see the pointer's low byte and treat every OFF
+    // as ON. NSInvocation passes the scalar by value.
+    NSMethodSignature *signature = [DYConfig instanceMethodSignatureForSelector:setter];
+    if (!signature) {
+        DYLog(@"toggle %@: no method signature", setterName);
+        return;
+    }
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    invocation.selector = setter;
+    invocation.target = config;
+    BOOL value = sender.on;
+    [invocation setArgument:&value atIndex:2];
+    [invocation invoke];
 
-    [[DYConfig shared] synchronize];
+    [config synchronize];
     DYLog(@"toggle %@ -> %@", setterName, sender.on ? @"ON" : @"OFF");
 }
 

@@ -297,9 +297,14 @@ static const NSTimeInterval kTapCooldown = 6.0;
 
 - (void)updateStatus:(NSString *)status {
     self.lastStatus = status;
+    __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.onUpdate) {
-            self.onUpdate(self.state, status);
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        if (strongSelf.onUpdate) {
+            strongSelf.onUpdate(strongSelf.state, status);
         }
     });
 }

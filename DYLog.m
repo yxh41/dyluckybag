@@ -61,4 +61,11 @@ void DYLogWrite(NSString *format, ...) {
     }
 }
 
+#else
+
+// Release builds compile logging out entirely. Emit one dummy symbol so this
+// translation unit is not empty — an empty object file upsets some linkers and
+// makes it look like the file was silently dropped from the build.
+void DYLuckyBagLogCompiledOut(void) {}
+
 #endif /* DEBUG */

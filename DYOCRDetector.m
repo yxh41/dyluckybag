@@ -140,10 +140,11 @@
     // 100 ms, which matters because we scan roughly once a second.
     request.recognitionLevel = VNRequestTextRecognitionLevelFast;
     request.usesLanguageCorrection = NO;
-    if (@available(iOS 16.0, *)) {
-        // zh-Hans + en-US covers Douyin UI chrome and numeric countdowns.
-        request.recognitionLanguages = @[ @"zh-Hans", @"en-US" ];
-    }
+    // zh-Hans covers Douyin's Chinese UI chrome, en-US the numeric countdowns.
+    // recognitionLanguages exists since iOS 13, so no availability guard is
+    // needed against this project's iOS 15 deployment target — guarding it at
+    // iOS 16 would have silently left the recogniser on the default locale.
+    request.recognitionLanguages = @[ @"zh-Hans", @"en-US" ];
 
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
