@@ -45,14 +45,21 @@ jobs:
           rm -rf "$THEOS/sdks"
           git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
           git -C "$THEOS/sdks" sparse-checkout set iPhoneOS16.5.sdk
-          echo "== building scheme: $SCHEME =="
+          # roothide shares the exact same /var/jb layout as theos' 'rootless'
+          # scheme, and theos has NO 'roothide' package scheme — passing it
+          # makes `make` abort with "'roothide' package scheme does not exist".
+          # So both matrix legs compile with THEOS_PACKAGE_SCHEME=rootless and
+          # only the output filename differs, so the user gets a clearly
+          # labelled roothide package that is byte-compatible with rootless.
+          BUILD_SCHEME=rootless
+          echo "== building scheme: $SCHEME (theos layout: $BUILD_SCHEME) =="
           echo "== building RELEASE (DYLog compiled out) =="
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$SCHEME
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME
           mkdir -p out-rel && cp packages/*.deb "out-rel/DYLuckyBag-$SCHEME.deb"
           echo "== building DEBUG (DYLog + file sink, for field diagnosis) =="
           make clean
           rm -rf packages
-          make package DEBUG=1 THEOS_PACKAGE_SCHEME=$SCHEME
+          make package DEBUG=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME
           mkdir -p out-dbg && cp packages/*.deb "out-dbg/DYLuckyBag-$SCHEME-debug.deb"
 
       # Surface the failure inline so the human can copy it straight from the
