@@ -1,4 +1,4 @@
-name: Build DYLuckyBag (rootless)
+name: Build DYLuckyBag (rootless + roothide)
 
 # Only build the dev branch. Pushing artifacts to ci-artifacts does NOT retrigger
 # this workflow (ci-artifacts is excluded), avoiding a publish -> build loop.
@@ -13,8 +13,14 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    # Build both package schemes in parallel, each producing a release + debug deb.
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [rootless, roothide]
     env:
       THEOS: "${{ github.workspace }}/theos"
+      SCHEME: "${{ matrix.scheme }}"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,14 +42,15 @@ jobs:
           rm -rf "$THEOS/sdks"
           git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
           git -C "$THEOS/sdks" sparse-checkout set iPhoneOS16.5.sdk
+          echo "== building scheme: $SCHEME =="
           echo "== building RELEASE (DYLog compiled out) =="
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          mkdir -p out-rel && cp packages/*.deb out-rel/DYLuckyBag.deb
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$SCHEME
+          mkdir -p out-rel && cp packages/*.deb "out-rel/DYLuckyBag-$SCHEME.deb"
           echo "== building DEBUG (DYLog + file sink, for field diagnosis) =="
           make clean
           rm -rf packages
-          make package DEBUG=1 THEOS_PACKAGE_SCHEME=rootless
-          mkdir -p out-dbg && cp packages/*.deb out-dbg/DYLuckyBag-debug.deb
+          make package DEBUG=1 THEOS_PACKAGE_SCHEME=$SCHEME
+          mkdir -p out-dbg && cp packages/*.deb "out-dbg/DYLuckyBag-$SCHEME-debug.deb"
 
       # Surface the failure inline so the human can copy it straight from the
       # run log instead of hunting for a downloadable artifact. Runs even when
@@ -51,7 +58,7 @@ jobs:
       - name: Surface build errors
         if: always()
         run: |
-          echo "## Build diagnostics" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Build diagnostics (scheme: $SCHEME)" >> "$GITHUB_STEP_SUMMARY"
           if [ ! -f build.log ]; then
             echo "build.log was NOT produced — the build step likely died before make ran (theos/SDK clone, OOM, or runner kill)." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -62,7 +69,7 @@ jobs:
           echo "### last 70 lines of build.log" >> "$GITHUB_STEP_SUMMARY"
           tail -n 70 build.log >> "$GITHUB_STEP_SUMMARY"
           # Also echo to the live log for quick copy-paste.
-          echo "================ BUILD ERROR SUMMARY ================"
+          echo "================ BUILD ERROR SUMMARY (scheme: $SCHEME) ================"
           grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory" build.log | head -80 || true
           echo "------------------ build.log tail ------------------"
           tail -n 70 build.log
@@ -76,19 +83,16 @@ jobs:
           git config user.email "ci@local"
           git config user.name "CI"
           mkdir -p artifacts
-          if [ -f build.log ]; then cp build.log artifacts/ci-last-build.log; fi
-          if [ -f out-rel/DYLuckyBag.deb ]; then cp out-rel/DYLuckyBag.deb artifacts/DYLuckyBag.deb; fi
-          if [ -f out-dbg/DYLuckyBag-debug.deb ]; then cp out-dbg/DYLuckyBag-debug.deb artifacts/DYLuckyBag-debug.deb; fi
-          if [ -f artifacts/ci-last-build.log ] || ls artifacts/*.deb >/dev/null 2>&1; then
+          if [ -f build.log ]; then cp build.log "artifacts/ci-last-build-$SCHEME.log"; fi
+          if [ -f "out-rel/DYLuckyBag-$SCHEME.deb" ]; then cp "out-rel/DYLuckyBag-$SCHEME.deb" "artifacts/DYLuckyBag-$SCHEME.deb"; fi
+          if [ -f "out-dbg/DYLuckyBag-$SCHEME-debug.deb" ]; then cp "out-dbg/DYLuckyBag-$SCHEME-debug.deb" "artifacts/DYLuckyBag-$SCHEME-debug.deb"; fi
+          if ls artifacts/* >/dev/null 2>&1; then
             # .gitignore contains "*.deb", so the .deb must be force-added or it
             # is silently skipped and never reaches ci-artifacts (learned the
             # hard way on the NextUp3 build).
             git add -A -f artifacts
-            git commit -m "ci artifacts (${{ github.sha }})" || echo "nothing to commit"
-            # Not fatal: on a private repo whose Actions permissions are left at
-            # read-only, this push is rejected. The upload-artifact steps below
-            # do not need write permissions and still deliver the packages, so
-            # report the failure rather than aborting the job.
+            git commit -m "ci artifacts (${{ github.sha }} / $SCHEME)" || echo "nothing to commit"
+            # Not fatal: report the failure rather than aborting the job.
             if ! git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts; then
               echo "WARNING: could not push ci-artifacts — run 'git push' error above. (Settings > Actions > Workflow permissions must be Read and write; also check branch protection.)"
             fi
@@ -102,17 +106,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dyluckybag-debs
+          name: dyluckybag-debs-${{ matrix.scheme }}
           path: |
-            out-rel/DYLuckyBag.deb
-            out-dbg/DYLuckyBag-debug.deb
+            out-rel/DYLuckyBag-${{ matrix.scheme }}.deb
+            out-dbg/DYLuckyBag-${{ matrix.scheme }}-debug.deb
           if-no-files-found: warn
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-${{ matrix.scheme }}
           path: build.log
           if-no-files-found: warn
 
@@ -122,16 +126,16 @@ jobs:
         if: always()
         run: |
           ok=1
-          if [ -f out-rel/DYLuckyBag.deb ]; then
-            echo "BUILD OK (release): $(ls -l out-rel/DYLuckyBag.deb)"
+          if [ -f "out-rel/DYLuckyBag-$SCHEME.deb" ]; then
+            echo "BUILD OK (release/$SCHEME): $(ls -l out-rel/DYLuckyBag-$SCHEME.deb)"
           else
-            echo "BUILD FAILED: no release .deb"
+            echo "BUILD FAILED: no release $SCHEME .deb"
             ok=0
           fi
-          if [ -f out-dbg/DYLuckyBag-debug.deb ]; then
-            echo "BUILD OK (debug): $(ls -l out-dbg/DYLuckyBag-debug.deb)"
+          if [ -f "out-dbg/DYLuckyBag-$SCHEME-debug.deb" ]; then
+            echo "BUILD OK (debug/$SCHEME): $(ls -l out-dbg/DYLuckyBag-$SCHEME-debug.deb)"
           else
-            echo "BUILD FAILED: no debug .deb"
+            echo "BUILD FAILED: no debug $SCHEME .deb"
             ok=0
           fi
           [ "$ok" = "1" ] || exit 1
