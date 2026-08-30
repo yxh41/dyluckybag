@@ -45,6 +45,28 @@ jobs:
           make package DEBUG=1 THEOS_PACKAGE_SCHEME=rootless
           mkdir -p out-dbg && cp packages/*.deb out-dbg/DYLuckyBag-debug.deb
 
+      # Surface the failure inline so the human can copy it straight from the
+      # run log instead of hunting for a downloadable artifact. Runs even when
+      # the build step (continue-on-error) or the publish step failed.
+      - name: Surface build errors
+        if: always()
+        run: |
+          echo "## Build diagnostics" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f build.log ]; then
+            echo "build.log was NOT produced — the build step likely died before make ran (theos/SDK clone, OOM, or runner kill)." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "### error / fatal lines" >> "$GITHUB_STEP_SUMMARY"
+          grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory|'UIKit|'Vision" build.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### last 70 lines of build.log" >> "$GITHUB_STEP_SUMMARY"
+          tail -n 70 build.log >> "$GITHUB_STEP_SUMMARY"
+          # Also echo to the live log for quick copy-paste.
+          echo "================ BUILD ERROR SUMMARY ================"
+          grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory" build.log | head -80 || true
+          echo "------------------ build.log tail ------------------"
+          tail -n 70 build.log
+
       - name: Publish artifacts to ci-artifacts branch
         if: always()
         env:
@@ -67,8 +89,9 @@ jobs:
             # read-only, this push is rejected. The upload-artifact steps below
             # do not need write permissions and still deliver the packages, so
             # report the failure rather than aborting the job.
-            git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts \
-              || echo "WARNING: could not push ci-artifacts (check Settings > Actions > Workflow permissions)"
+            if ! git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts; then
+              echo "WARNING: could not push ci-artifacts — run 'git push' error above. (Settings > Actions > Workflow permissions must be Read and write; also check branch protection.)"
+            fi
           else
             echo "no artifacts produced; nothing to publish"
           fi
