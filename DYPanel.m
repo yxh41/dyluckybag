@@ -21,6 +21,18 @@ static const CGFloat kPanelHeight = 420.0;
 @property (nonatomic, strong) UILabel *roomLabel;
 @end
 
+@interface DYPassThroughView : UIView
+@end
+@implementation DYPassThroughView
+// Let touches fall through to Douyin's own views in the transparent areas, so
+// the floating overlay never steals scroll / tap gestures from the feed or the
+// video player. Only real subviews (the 福 button, the panel) stay interactive.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit;
+}
+@end
+
 @implementation DYPanel
 
 + (instancetype)shared {
@@ -49,6 +61,19 @@ static const CGFloat kPanelHeight = 420.0;
     self.visible = NO;
     self.panelExpanded = NO;
     self.panelView.hidden = YES;
+}
+
+/// "收起": collapse the panel but keep the floating 福 button on screen, so the
+/// user can bring the panel back with a single tap — no app restart needed.
+- (void)collapse {
+    self.panelExpanded = NO;
+    self.panelView.hidden = YES;
+}
+
+- (void)handleAppBecameActive {
+    if (!self.visible) {
+        [self show];
+    }
 }
 
 - (void)toggle {
@@ -108,8 +133,12 @@ static const CGFloat kPanelHeight = 420.0;
     window.userInteractionEnabled = YES;
 
     UIViewController *root = [[UIViewController alloc] init];
-    root.view.backgroundColor = [UIColor clearColor];
-    root.view.userInteractionEnabled = YES;
+    // A pass-through root view so the transparent overlay does not swallow
+    // Douyin's gestures; only the floating button and panel are interactive.
+    DYPassThroughView *rootView = [[DYPassThroughView alloc] initWithFrame:screen];
+    rootView.backgroundColor = [UIColor clearColor];
+    rootView.userInteractionEnabled = YES;
+    root.view = rootView;
     window.rootViewController = root;
 
     self.window = window;
@@ -127,6 +156,14 @@ static const CGFloat kPanelHeight = 420.0;
      addObserver:self
      selector:@selector(handleWinNotification:)
      name:@"DYLuckyBagWinNotification"
+     object:nil];
+
+    // Re-surface the panel automatically when Douyin returns to the foreground,
+    // so a full hide never requires restarting the app to bring it back.
+    [[NSNotificationCenter defaultCenter]
+     addObserver:self
+     selector:@selector(handleAppBecameActive)
+     name:UIApplicationDidBecomeActiveNotification
      object:nil];
 }
 
@@ -221,16 +258,30 @@ static const CGFloat kPanelHeight = 420.0;
     title.font = [UIFont boldSystemFontOfSize:17.0];
     [panel addSubview:title];
 
-    UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeButton.frame = CGRectMake(width - 56.0, cursor, 44.0, 26.0);
-    [closeButton setTitle:@"隐藏" forState:UIControlStateNormal];
-    [closeButton setTitleColor:[UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0]
-                      forState:UIControlStateNormal];
-    closeButton.titleLabel.font = [UIFont systemFontOfSize:14.0];
-    [closeButton addTarget:self
-                    action:@selector(hide)
-          forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:closeButton];
+    UIButton *collapseButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    collapseButton.frame = CGRectMake(width - 56.0, cursor, 44.0, 26.0);
+    [collapseButton setTitle:@"收起" forState:UIControlStateNormal];
+    [collapseButton setTitleColor:[UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0]
+                         forState:UIControlStateNormal];
+    collapseButton.titleLabel.font = [UIFont systemFontOfSize:14.0];
+    [collapseButton addTarget:self
+                       action:@selector(collapse)
+             forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:collapseButton];
+
+    // Full hide (window removed). Unlike "收起", this also stops the floating
+    // 福 button. Bring it back by sending Douyin to the background and
+    // re-opening it (or restart the app).
+    UIButton *hideButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    hideButton.frame = CGRectMake(width - 104.0, cursor, 44.0, 26.0);
+    [hideButton setTitle:@"隐藏" forState:UIControlStateNormal];
+    [hideButton setTitleColor:[UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:1.0]
+                     forState:UIControlStateNormal];
+    hideButton.titleLabel.font = [UIFont systemFontOfSize:14.0];
+    [hideButton addTarget:self
+                   action:@selector(hide)
+         forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:hideButton];
 
     cursor += 32.0;
 

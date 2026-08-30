@@ -19,6 +19,14 @@ static NSString *const kWordWon        = @"中奖";
 static const CGFloat kTapProximity = 44.0;
 static const NSTimeInterval kTapCooldown = 6.0;
 
+// Scan cadence adapts to whether a lucky bag is actually on screen. Fast while
+// one is present (we want to catch the "参与" button immediately); slow when the
+// user is just scrolling the feed / watching short videos, so the periodic OCR
+// pass never competes with video playback for the main thread.
+static const NSTimeInterval kFastInterval = 1.5;
+static const NSTimeInterval kSlowInterval = 6.0;
+static const NSInteger kQuietThreshold = 10;
+
 @interface DYEngine ()
 @property (nonatomic) NSTimer *timer;
 @property (nonatomic) BOOL scanning;
@@ -28,6 +36,8 @@ static const NSTimeInterval kTapCooldown = 6.0;
 @property (nonatomic) CGPoint lastTapPoint;
 @property (nonatomic) CFTimeInterval lastTapTime;
 @property (nonatomic) NSString *lastKeyword;
+@property (nonatomic) NSInteger quietPasses;
+@property (nonatomic) NSTimeInterval currentInterval;
 @end
 
 @implementation DYEngine
@@ -46,6 +56,8 @@ static const NSTimeInterval kTapCooldown = 6.0;
         _state = DYEngineStateIdle;
         _lastStatus = @"未启动";
         _lastTapTime = -kTapCooldown;
+        _quietPasses = 0;
+        _currentInterval = kFastInterval;
     }
     return self;
 }
@@ -59,13 +71,7 @@ static const NSTimeInterval kTapCooldown = 6.0;
     self.running = YES;
 
     NSTimeInterval interval = MAX(0.5, [DYConfig shared].scanInterval);
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:interval
-                                                  target:self
-                                                selector:@selector(timerFired:)
-                                                userInfo:nil
-                                                 repeats:YES];
-    // Common modes so scrolling the feed does not stall the timer.
-    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+    [self restartTimerWithInterval:interval];
 
     DYLog(@"engine started, interval=%.1fs", interval);
     [self updateStatus:@"已启动，等待福袋"];
@@ -77,6 +83,27 @@ static const NSTimeInterval kTapCooldown = 6.0;
     self.running = NO;
     DYLog(@"engine stopped");
     [self updateStatus:@"已停止"];
+}
+
+- (void)restartTimerWithInterval:(NSTimeInterval)interval {
+    [self.timer invalidate];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:interval
+                                                  target:self
+                                                selector:@selector(timerFired:)
+                                                userInfo:nil
+                                                 repeats:YES];
+    // Common modes so scrolling the feed does not stall the timer.
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)adaptScanRate {
+    NSTimeInterval target = (self.quietPasses > kQuietThreshold) ? kSlowInterval : kFastInterval;
+    if (fabs(target - self.currentInterval) < 0.01) {
+        return;
+    }
+    self.currentInterval = target;
+    [self restartTimerWithInterval:target];
+    DYLog(@"scan rate -> %.1fs (quiet passes=%ld)", target, (long)self.quietPasses);
 }
 
 - (void)timerFired:(NSTimer *)timer {
@@ -109,6 +136,18 @@ static const NSTimeInterval kTapCooldown = 6.0;
 #pragma mark - Decision making
 
 - (void)handleHits:(NSArray<DYTextHit *> *)hits {
+    // Adaptive scan rate: when no lucky bag has been on screen for a while the
+    // user is almost certainly not in a live room we care about, so slow the
+    // OCR cadence right down. The instant a bag reappears we snap back to fast.
+    BOOL sawBag = NO;
+    if (hits.count > 0) {
+        if ([hits dy_firstHitContaining:kWordBag]) {
+            sawBag = YES;
+        }
+    }
+    self.quietPasses = sawBag ? 0 : (self.quietPasses + 1);
+    [self adaptScanRate];
+
     if (hits.count == 0) {
         return;
     }

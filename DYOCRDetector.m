@@ -13,6 +13,18 @@
 
 @implementation DYOCRDetector
 
+// OCR (Vision) is the expensive part of a scan pass (~50-100 ms). Run it on a
+// dedicated serial queue so the main thread — and therefore Douyin's UI and
+// video playback — is never stalled by our periodic screen analysis.
+static dispatch_queue_t DYOCRQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.dyluckybag.ocr", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
 + (instancetype)shared {
     static DYOCRDetector *instance;
     static dispatch_once_t onceToken;
@@ -86,6 +98,9 @@
 #pragma mark - OCR
 
 - (void)detectWithCompletion:(DYDetectionCompletion)completion {
+    // Screen capture must happen on the main thread (it reads UIKit layer
+    // content), but it is only a few milliseconds. The OCR below is the costly
+    // part and is dispatched to a background queue.
     UIImage *image = [self captureScreen];
     CGImageRef cgImage = image.CGImage;
     if (!cgImage) {
@@ -98,11 +113,8 @@
 
     CGSize screenSize = UIScreen.mainScreen.bounds.size;
 
-    __weak typeof(self) weakSelf = self;
     VNRecognizeTextRequest *request =
         [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *req, NSError *error) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-
             NSMutableArray<DYTextHit *> *hits = [NSMutableArray array];
 
             for (VNRecognizedTextObservation *observation in req.results) {
@@ -118,8 +130,8 @@
                 DYTextHit *hit = [[DYTextHit alloc] init];
                 hit.text = best.string ?: @"";
                 hit.confidence = best.confidence;
-                hit.rect = [strongSelf uiKitRectFromNormalized:observation.boundingBox
-                                                    screenSize:screenSize];
+                hit.rect = [self uiKitRectFromNormalized:observation.boundingBox
+                                              screenSize:screenSize];
                 [hits addObject:hit];
             }
 
@@ -149,11 +161,18 @@
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
 
-    NSError *error = nil;
-    [handler performRequests:@[ request ] error:&error];
-    if (error) {
-        DYLog(@"performRequests failed: %@", error.localizedDescription);
-    }
+    dispatch_async(DYOCRQueue(), ^{
+        NSError *error = nil;
+        [handler performRequests:@[ request ] error:&error];
+        if (error) {
+            DYLog(@"performRequests failed: %@", error.localizedDescription);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) {
+                    completion(@[], error);
+                }
+            });
+        }
+    });
 }
 
 #pragma mark - Coordinate conversion
