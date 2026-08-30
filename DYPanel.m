@@ -3,9 +3,17 @@
 #import "DYEngine.h"
 #import "DYLog.h"
 #import <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>
 
-static const CGFloat kFloatSize = 56.0;
-static const CGFloat kPanelHeight = 420.0;
+static const CGFloat kFloatSize = 60.0;
+static const CGFloat kPanelHeight = 452.0;
+
+// Festive palette: red -> deep red gradient with a gold rim.
+#define DY_RED1  [UIColor colorWithRed:1.00 green:0.36 blue:0.36 alpha:1.0]
+#define DY_RED2  [UIColor colorWithRed:0.85 green:0.12 blue:0.18 alpha:1.0]
+#define DY_GOLD  [UIColor colorWithRed:1.00 green:0.84 blue:0.42 alpha:1.0]
+#define DY_CARD  [UIColor colorWithWhite:1.0 alpha:0.08]
+#define DY_SEP   [UIColor colorWithWhite:1.0 alpha:0.10]
 
 @interface DYPanel ()
 @property (nonatomic, strong) UIWindow *window;
@@ -67,7 +75,16 @@ static const CGFloat kPanelHeight = 420.0;
 /// user can bring the panel back with a single tap — no app restart needed.
 - (void)collapse {
     self.panelExpanded = NO;
-    self.panelView.hidden = YES;
+    [UIView animateWithDuration:0.22
+                     animations:^{
+        self.panelView.alpha = 0.0;
+        CGRect f = self.panelView.frame;
+        f.origin.y += 24.0;
+        self.panelView.frame = f;
+    }
+                     completion:^(BOOL finished) {
+        self.panelView.hidden = YES;
+    }];
 }
 
 - (void)handleAppBecameActive {
@@ -183,18 +200,43 @@ static const CGFloat kPanelHeight = 420.0;
 
 - (void)buildFloatButtonInView:(UIView *)superview {
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat x = screen.size.width - kFloatSize - 12.0;
-    CGFloat y = screen.size.height * 0.35;
+    CGFloat x = screen.size.width - kFloatSize - 14.0;
+    CGFloat y = screen.size.height * 0.34;
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
     button.frame = CGRectMake(x, y, kFloatSize, kFloatSize);
-    button.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
+    button.backgroundColor = [UIColor clearColor];
     button.layer.cornerRadius = kFloatSize / 2.0;
-    button.layer.borderWidth = 1.0;
-    button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
-    button.titleLabel.font = [UIFont boldSystemFontOfSize:22.0];
+
+    // Festive red->deep-red gradient fill.
+    CAGradientLayer *grad = [CAGradientLayer layer];
+    grad.frame = button.bounds;
+    grad.cornerRadius = kFloatSize / 2.0;
+    grad.colors = @[ (__bridge id)DY_RED1.CGColor, (__bridge id)DY_RED2.CGColor ];
+    grad.startPoint = CGPointMake(0.0, 0.0);
+    grad.endPoint = CGPointMake(1.0, 1.0);
+    [button.layer insertSublayer:grad atIndex:0];
+
+    // Gold rim + soft drop shadow for depth.
+    button.layer.borderWidth = 2.0;
+    button.layer.borderColor = DY_GOLD.CGColor;
+    button.layer.shadowColor = [UIColor colorWithRed:0.8 green:0.1 blue:0.15 alpha:1.0].CGColor;
+    button.layer.shadowOpacity = 0.5;
+    button.layer.shadowRadius = 8.0;
+    button.layer.shadowOffset = CGSizeMake(0.0, 4.0);
+
     [button setTitle:@"福" forState:UIControlStateNormal];
-    [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont boldSystemFontOfSize:30.0];
+    [button setTitleColor:DY_GOLD forState:UIControlStateNormal];
+
+    // Gentle attention pulse on the shadow.
+    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"shadowOpacity"];
+    pulse.fromValue = @(0.35);
+    pulse.toValue = @(0.75);
+    pulse.duration = 1.3;
+    pulse.autoreverses = YES;
+    pulse.repeatCount = HUGE_VALF;
+    [button.layer addAnimation:pulse forKey:@"dyPulse"];
 
     [button addTarget:self
                action:@selector(floatButtonTapped)
@@ -209,11 +251,45 @@ static const CGFloat kPanelHeight = 420.0;
 }
 
 - (void)floatButtonTapped {
+    // Springy tap feedback.
+    [UIView animateWithDuration:0.12
+                     animations:^{
+        self.floatButton.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    }
+                     completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.22
+                              delay:0.0
+             usingSpringWithDamping:0.5
+              initialSpringVelocity:0.7
+                            options:0
+                         animations:^{
+            self.floatButton.transform = CGAffineTransformIdentity;
+        }
+                         completion:nil];
+    }];
+
     self.panelExpanded = !self.panelExpanded;
-    self.panelView.hidden = !self.panelExpanded;
     if (self.panelExpanded) {
+        self.panelView.hidden = NO;
+        self.panelView.alpha = 0.0;
+        CGRect f = self.panelView.frame;
+        CGFloat finalY = f.origin.y;
+        f.origin.y += 24.0;
+        self.panelView.frame = f;
+        [UIView animateWithDuration:0.26
+                              delay:0.0
+             usingSpringWithDamping:0.8
+              initialSpringVelocity:0.6
+                            options:0
+                         animations:^{
+            self.panelView.alpha = 1.0;
+            self.panelView.frame = CGRectMake(f.origin.x, finalY, f.size.width, f.size.height);
+        }
+                         completion:nil];
         [self refresh];
         [self.panelView.superview bringSubviewToFront:self.panelView];
+    } else {
+        [self collapse];
     }
 }
 
@@ -237,43 +313,61 @@ static const CGFloat kPanelHeight = 420.0;
 
 - (void)buildPanelInView:(UIView *)superview {
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat width = screen.size.width - 24.0;
-    CGFloat x = 12.0;
+    CGFloat width = screen.size.width - 28.0;
+    CGFloat x = 14.0;
     CGFloat y = screen.size.height - kPanelHeight - 24.0;
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, width, kPanelHeight)];
-    panel.backgroundColor = [[UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:0.96] colorWithAlphaComponent:0.96];
-    panel.layer.cornerRadius = 16.0;
+    panel.backgroundColor = [UIColor clearColor];
+    panel.layer.cornerRadius = 22.0;
     panel.layer.borderWidth = 1.0;
-    panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
+    panel.layer.masksToBounds = YES;
     panel.hidden = YES;
 
-    CGFloat cursor = 12.0;
-    CGFloat innerWidth = width - 24.0;
+    // Frosted dark gradient background.
+    CAGradientLayer *bg = [CAGradientLayer layer];
+    bg.frame = panel.bounds;
+    bg.cornerRadius = 22.0;
+    bg.colors = @[ (__bridge id)[UIColor colorWithRed:0.13 green:0.13 blue:0.17 alpha:0.97].CGColor,
+                   (__bridge id)[UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.98].CGColor ];
+    bg.startPoint = CGPointMake(0.0, 0.0);
+    bg.endPoint = CGPointMake(0.0, 1.0);
+    [panel.layer insertSublayer:bg atIndex:0];
 
-    // Title
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12.0, cursor, innerWidth, 26.0)];
+    CGFloat cursor = 16.0;
+    CGFloat innerWidth = width - 28.0;
+
+    // Header: title + small red badge dot + subtitle.
+    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor + 5.0, 9.0, 9.0)];
+    dot.backgroundColor = DY_RED1;
+    dot.layer.cornerRadius = 4.5;
+    [panel addSubview:dot];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(32.0, cursor, innerWidth - 100.0, 20.0)];
     title.text = @"抖音福袋助手";
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:17.0];
     [panel addSubview:title];
 
+    UILabel *subtitle = [[UILabel alloc] initWithFrame:CGRectMake(32.0, cursor + 20.0, innerWidth - 100.0, 16.0)];
+    subtitle.text = @"OCR 自动参与福袋";
+    subtitle.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    subtitle.font = [UIFont systemFontOfSize:11.0];
+    [panel addSubview:subtitle];
+
     UIButton *collapseButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    collapseButton.frame = CGRectMake(width - 56.0, cursor, 44.0, 26.0);
+    collapseButton.frame = CGRectMake(width - 100.0, cursor, 44.0, 28.0);
     [collapseButton setTitle:@"收起" forState:UIControlStateNormal];
-    [collapseButton setTitleColor:[UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0]
-                         forState:UIControlStateNormal];
+    [collapseButton setTitleColor:DY_GOLD forState:UIControlStateNormal];
     collapseButton.titleLabel.font = [UIFont systemFontOfSize:14.0];
     [collapseButton addTarget:self
                        action:@selector(collapse)
              forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:collapseButton];
 
-    // Full hide (window removed). Unlike "收起", this also stops the floating
-    // 福 button. Bring it back by sending Douyin to the background and
-    // re-opening it (or restart the app).
     UIButton *hideButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    hideButton.frame = CGRectMake(width - 104.0, cursor, 44.0, 26.0);
+    hideButton.frame = CGRectMake(width - 54.0, cursor, 44.0, 28.0);
     [hideButton setTitle:@"隐藏" forState:UIControlStateNormal];
     [hideButton setTitleColor:[UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:1.0]
                      forState:UIControlStateNormal];
@@ -283,79 +377,95 @@ static const CGFloat kPanelHeight = 420.0;
          forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:hideButton];
 
-    cursor += 32.0;
+    cursor += 46.0;
 
-    // Status
-    UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(12.0, cursor, innerWidth, 20.0)];
-    status.textColor = [UIColor colorWithWhite:0.82 alpha:1.0];
+    // Status pill.
+    UIView *statusCard = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor, innerWidth, 40.0)];
+    statusCard.backgroundColor = DY_CARD;
+    statusCard.layer.cornerRadius = 12.0;
+    [panel addSubview:statusCard];
+
+    UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(14.0, 0.0, innerWidth - 28.0, 40.0)];
+    status.textColor = [UIColor colorWithWhite:0.86 alpha:1.0];
     status.font = [UIFont systemFontOfSize:13.0];
     status.text = @"—";
-    [panel addSubview:status];
+    [statusCard addSubview:status];
     self.statusLabel = status;
-
-    cursor += 26.0;
-
-    // Stats row
-    CGFloat statWidth = innerWidth / 3.0;
-    self.joinLabel = [self addStatAtX:12.0
-                                    y:cursor
-                                width:statWidth
-                                title:@"今日参与"
-                              toPanel:panel];
-    self.winLabel = [self addStatAtX:12.0 + statWidth
-                                   y:cursor
-                               width:statWidth
-                               title:@"今日中奖"
-                             toPanel:panel];
-    self.roomLabel = [self addStatAtX:12.0 + statWidth * 2.0
-                                    y:cursor
-                                width:statWidth
-                                title:@"巡逻房间"
-                              toPanel:panel];
 
     cursor += 52.0;
 
-    // Master switch
+    // Stats: three cards in a row.
+    CGFloat statWidth = (innerWidth - 16.0) / 3.0;
+    self.joinLabel = [self addStatAtX:16.0
+                                    y:cursor
+                                width:statWidth
+                              caption:@"今日参与"
+                             toPanel:panel];
+    self.winLabel = [self addStatAtX:16.0 + statWidth + 8.0
+                                    y:cursor
+                                width:statWidth
+                              caption:@"今日中奖"
+                             toPanel:panel];
+    self.roomLabel = [self addStatAtX:16.0 + (statWidth + 8.0) * 2.0
+                                     y:cursor
+                                 width:statWidth
+                               caption:@"巡逻房间"
+                              toPanel:panel];
+
+    cursor += 64.0;
+
+    // Master switch row.
+    UIView *masterRow = [[UIView alloc] initWithFrame:CGRectMake(0.0, cursor, width, 44.0)];
+    [panel addSubview:masterRow];
+
+    UILabel *masterLabel = [[UILabel alloc]
+        initWithFrame:CGRectMake(16.0, 0.0, innerWidth - 70.0, 44.0)];
+    masterLabel.text = @"总开关";
+    masterLabel.textColor = [UIColor whiteColor];
+    masterLabel.font = [UIFont systemFontOfSize:15.0];
+    [masterRow addSubview:masterLabel];
+
     UISwitch *masterSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
-    masterSwitch.center = CGPointMake(width - 12.0 - masterSwitch.frame.size.width / 2.0,
-                                      cursor + 15.0);
+    masterSwitch.center = CGPointMake(width - 16.0 - masterSwitch.frame.size.width / 2.0,
+                                      22.0);
+    masterSwitch.onTintColor = DY_RED2;
     masterSwitch.on = [DYConfig shared].masterEnabled;
     [masterSwitch addTarget:self
                      action:@selector(masterSwitchChanged:)
            forControlEvents:UIControlEventValueChanged];
-    [panel addSubview:masterSwitch];
+    [masterRow addSubview:masterSwitch];
 
-    UILabel *masterLabel = [[UILabel alloc]
-        initWithFrame:CGRectMake(12.0, cursor, innerWidth - 60.0, 30.0)];
-    masterLabel.text = @"总开关";
-    masterLabel.textColor = [UIColor whiteColor];
-    masterLabel.font = [UIFont systemFontOfSize:15.0];
-    [panel addSubview:masterLabel];
+    cursor += 44.0;
 
-    cursor += 40.0;
+    // Section separator.
+    UIView *sep1 = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor, innerWidth, 1.0)];
+    sep1.backgroundColor = DY_SEP;
+    [panel addSubview:sep1];
+    cursor += 10.0;
 
-    // Patrol mode
-    UILabel *modeLabel = [[UILabel alloc] initWithFrame:CGRectMake(12.0, cursor, innerWidth, 20.0)];
+    // Patrol mode label.
+    UILabel *modeLabel = [[UILabel alloc] initWithFrame:CGRectMake(16.0, cursor, innerWidth, 18.0)];
     modeLabel.text = @"巡逻模式";
-    modeLabel.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-    modeLabel.font = [UIFont systemFontOfSize:13.0];
+    modeLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+    modeLabel.font = [UIFont systemFontOfSize:12.0];
     [panel addSubview:modeLabel];
-
     cursor += 24.0;
 
     UISegmentedControl *segmented =
         [[UISegmentedControl alloc] initWithItems:@[ @"仅检测", @"自动参与", @"全自动巡逻" ]];
-    segmented.frame = CGRectMake(12.0, cursor, innerWidth, 30.0);
+    segmented.frame = CGRectMake(16.0, cursor, innerWidth, 32.0);
     segmented.selectedSegmentIndex = (NSInteger)[DYConfig shared].patrolMode;
-    segmented.tintColor = [UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0];
+    segmented.tintColor = DY_RED2;
+    segmented.selectedSegmentTintColor = DY_RED2;
+    [segmented setTitleTextAttributes:@{ NSForegroundColorAttributeName: [UIColor whiteColor] }
+                             forState:UIControlStateSelected];
     [segmented addTarget:self
                   action:@selector(patrolModeChanged:)
         forControlEvents:UIControlEventValueChanged];
     [panel addSubview:segmented];
+    cursor += 44.0;
 
-    cursor += 42.0;
-
-    // Feature switches
+    // Feature switches.
     cursor = [self addToggleWithTitle:@"超级福袋 · 自动参与"
                                     y:cursor
                                toView:panel
@@ -389,21 +499,26 @@ static const CGFloat kPanelHeight = 420.0;
 - (UILabel *)addStatAtX:(CGFloat)x
                       y:(CGFloat)y
                   width:(CGFloat)width
-                  title:(NSString *)title
-                toPanel:(UIView *)panel {
-    UILabel *caption = [[UILabel alloc] initWithFrame:CGRectMake(x, y, width, 16.0)];
-    caption.text = title;
-    caption.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-    caption.font = [UIFont systemFontOfSize:11.0];
-    caption.textAlignment = NSTextAlignmentCenter;
-    [panel addSubview:caption];
+               caption:(NSString *)caption
+               toPanel:(UIView *)panel {
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(x, y, width, 52.0)];
+    card.backgroundColor = DY_CARD;
+    card.layer.cornerRadius = 14.0;
+    [panel addSubview:card];
 
-    UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(x, y + 18.0, width, 24.0)];
+    UILabel *cap = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 8.0, width, 14.0)];
+    cap.text = caption;
+    cap.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    cap.font = [UIFont systemFontOfSize:10.0];
+    cap.textAlignment = NSTextAlignmentCenter;
+    [card addSubview:cap];
+
+    UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 22.0, width, 24.0)];
     value.text = @"0";
-    value.textColor = [UIColor whiteColor];
-    value.font = [UIFont boldSystemFontOfSize:18.0];
+    value.textColor = DY_GOLD;
+    value.font = [UIFont boldSystemFontOfSize:19.0];
     value.textAlignment = NSTextAlignmentCenter;
-    [panel addSubview:value];
+    [card addSubview:value];
 
     return value;
 }
@@ -417,9 +532,9 @@ static const CGFloat kPanelHeight = 420.0;
     CGFloat width = container.frame.size.width;
 
     UISwitch *toggle = [[UISwitch alloc] initWithFrame:CGRectZero];
-    toggle.transform = CGAffineTransformMakeScale(0.85, 0.85);
+    toggle.onTintColor = DY_RED2;
     CGFloat toggleWidth = toggle.frame.size.width;
-    toggle.frame = CGRectMake(width - 12.0 - toggleWidth, y, toggleWidth, toggle.frame.size.height);
+    toggle.frame = CGRectMake(width - 16.0 - toggleWidth, y + 6.0, toggleWidth, toggle.frame.size.height);
 
     NSMethodSignature *signature = [DYConfig instanceMethodSignatureForSelector:getter];
     NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
@@ -441,13 +556,13 @@ static const CGFloat kPanelHeight = 420.0;
     [container addSubview:toggle];
 
     UILabel *label = [[UILabel alloc]
-        initWithFrame:CGRectMake(12.0, y + 4.0, width - toggleWidth - 28.0, 24.0)];
+        initWithFrame:CGRectMake(16.0, y + 6.0, width - toggleWidth - 36.0, 28.0)];
     label.text = title;
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:14.0];
     [container addSubview:label];
 
-    return y + 38.0;
+    return y + 44.0;
 }
 
 #pragma mark - Actions
@@ -511,20 +626,26 @@ static const CGFloat kPanelHeight = 420.0;
     UIView *host = self.window.rootViewController.view;
     CGFloat width = UIScreen.mainScreen.bounds.size.width - 32.0;
 
-    UILabel *banner = [[UILabel alloc] initWithFrame:CGRectMake(16.0, -70.0, width, 56.0)];
+    UILabel *banner = [[UILabel alloc] initWithFrame:CGRectMake(16.0, -80.0, width, 56.0)];
     banner.text = [NSString stringWithFormat:@"🎉 %@", text];
     banner.textColor = [UIColor whiteColor];
-    banner.backgroundColor = [[UIColor colorWithRed:0.98 green:0.20 blue:0.35 alpha:1.0] colorWithAlphaComponent:0.96];
     banner.font = [UIFont boldSystemFontOfSize:15.0];
     banner.textAlignment = NSTextAlignmentCenter;
     banner.numberOfLines = 0;
-    banner.layer.cornerRadius = 12.0;
+    banner.layer.cornerRadius = 14.0;
     banner.clipsToBounds = YES;
     banner.alpha = 0.0;
 
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.frame = banner.bounds;
+    g.cornerRadius = 14.0;
+    g.colors = @[ (__bridge id)[UIColor colorWithRed:0.98 green:0.30 blue:0.42 alpha:1.0].CGColor,
+                   (__bridge id)[UIColor colorWithRed:0.86 green:0.13 blue:0.18 alpha:1.0].CGColor ];
+    [banner.layer insertSublayer:g atIndex:0];
+
     [host addSubview:banner];
 
-    CGFloat top = 60.0;
+    CGFloat top = 64.0;
     [UIView animateWithDuration:0.32
                      animations:^{
         banner.alpha = 1.0;
@@ -536,7 +657,7 @@ static const CGFloat kPanelHeight = 420.0;
             [UIView animateWithDuration:0.28
                              animations:^{
                 banner.alpha = 0.0;
-                banner.frame = CGRectMake(16.0, -70.0, width, 56.0);
+                banner.frame = CGRectMake(16.0, -80.0, width, 56.0);
             }
                              completion:^(BOOL done) {
                 [banner removeFromSuperview];

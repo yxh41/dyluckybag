@@ -32,7 +32,11 @@ jobs:
         run: brew install dpkg ldid 2>&1 | tee install.log
 
       # Clone + build in ONE step so build.log always captures the failure,
-      # even if the theos clone itself fails.
+      # even if the theos clone itself fails. rootless and roothide need
+      # DIFFERENT theos toolchains: standard theos/theos for rootless, and the
+      # roothide/theos fork (the ONLY one that knows the 'roothide' package
+      # scheme AND links against libroothide) for roothide. A plain rootless
+      # .deb does NOT load on roothide, so we must build it for real here.
       - name: Clone Theos + SDK and build
         id: build
         continue-on-error: true
@@ -40,26 +44,33 @@ jobs:
           set -o pipefail
           exec > >(tee build.log) 2>&1
           set -x
-          echo "== cloning theos =="
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          rm -rf "$THEOS/sdks"
-          git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
-          git -C "$THEOS/sdks" sparse-checkout set iPhoneOS16.5.sdk
-          # roothide shares the exact same /var/jb layout as theos' 'rootless'
-          # scheme, and theos has NO 'roothide' package scheme — passing it
-          # makes `make` abort with "'roothide' package scheme does not exist".
-          # So both matrix legs compile with THEOS_PACKAGE_SCHEME=rootless and
-          # only the output filename differs, so the user gets a clearly
-          # labelled roothide package that is byte-compatible with rootless.
-          BUILD_SCHEME=rootless
-          echo "== building scheme: $SCHEME (theos layout: $BUILD_SCHEME) =="
+          rm -rf "$THEOS"
+
+          if [ "$SCHEME" = "roothide" ]; then
+            echo "== installing roothide/theos (the only theos that knows the roothide scheme) =="
+            bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+            BUILD_SCHEME=roothide
+            BUILD_ARCHS=arm64e
+            # roothide packages require libroothide at runtime.
+            sed -i.bak -E 's|^Depends:.*|Depends: libroothide, firmware (>= 15.0)|' control
+          else
+            echo "== cloning standard theos + sdks =="
+            git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+            rm -rf "$THEOS/sdks"
+            git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
+            git -C "$THEOS/sdks" sparse-checkout set iPhoneOS16.5.sdk
+            BUILD_SCHEME=rootless
+            BUILD_ARCHS="arm64 arm64e"
+          fi
+
+          echo "== building scheme: $SCHEME (theos layout: $BUILD_SCHEME, arch: $BUILD_ARCHS) =="
           echo "== building RELEASE (DYLog compiled out) =="
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME ARCHS="$BUILD_ARCHS"
           mkdir -p out-rel && cp packages/*.deb "out-rel/DYLuckyBag-$SCHEME.deb"
           echo "== building DEBUG (DYLog + file sink, for field diagnosis) =="
           make clean
           rm -rf packages
-          make package DEBUG=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME
+          make package DEBUG=1 THEOS_PACKAGE_SCHEME=$BUILD_SCHEME ARCHS="$BUILD_ARCHS"
           mkdir -p out-dbg && cp packages/*.deb "out-dbg/DYLuckyBag-$SCHEME-debug.deb"
 
       # Surface the failure inline so the human can copy it straight from the
