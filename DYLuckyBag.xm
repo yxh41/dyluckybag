@@ -24,8 +24,7 @@ static void DYStartServices(void) {
 }
 
 %ctor {
-    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
-    DYLog(@"tweak loaded into %@ (v%@)", bundleID,
+    DYLog(@"tweak loaded into %@ (v%@)", NSBundle.mainBundle.bundleIdentifier,
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
 
     // Preferred path: start once the app has finished launching, plus a small

@@ -31,7 +31,10 @@ DYLuckyBag_FILES = \
 	DYPanel.m \
 	DYLog.m
 
-DYLuckyBag_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unsupported-availability-guard $(DY_PTRAUTH_CFLAGS)
+# DYLog() compiles to ((void)0) in release builds, so any variable that exists
+# only to feed a log line becomes "unused" and -Werror would fail the release
+# package. Demote that one warning to non-fatal; all other -Werror stays active.
+DYLuckyBag_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unsupported-availability-guard -Wno-error=unused-variable $(DY_PTRAUTH_CFLAGS)
 DYLuckyBag_FRAMEWORKS = UIKit CoreGraphics QuartzCore ImageIO Vision
 
 include $(THEOS_MAKE_PATH)/tweak.mk
