@@ -1,9 +1,10 @@
 name: Build DYLuckyBag (rootless + roothide)
 
-# Only build the dev branch. Pushing artifacts to ci-artifacts does NOT retrigger
-# this workflow (ci-artifacts is excluded), avoiding a publish -> build loop.
+# Only build the dev branch. Pushing artifacts to ci-artifacts-* does NOT
+# retrigger this workflow (those refs are not in the trigger list), avoiding a
+# publish -> build loop.
 permissions:
-  contents: write   # needed to force-push the .deb / build.log to ci-artifacts
+  contents: write   # needed to force-push logs/.deb to ci-artifacts-<scheme>
 
 on:
   push:
@@ -25,8 +26,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Capture this step's output too — if brew fails, build.log is never
+      # produced and we would otherwise be blind to the real error.
       - name: Install tooling
-        run: brew install dpkg ldid
+        run: brew install dpkg ldid 2>&1 | tee install.log
 
       # Clone + build in ONE step so build.log always captures the failure,
       # even if the theos clone itself fails.
@@ -59,51 +62,48 @@ jobs:
         if: always()
         run: |
           echo "## Build diagnostics (scheme: $SCHEME)" >> "$GITHUB_STEP_SUMMARY"
-          if [ ! -f build.log ]; then
-            echo "build.log was NOT produced — the build step likely died before make ran (theos/SDK clone, OOM, or runner kill)." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "### error / fatal lines" >> "$GITHUB_STEP_SUMMARY"
-          grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory|'UIKit|'Vision" build.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "### install.log (last 30)" >> "$GITHUB_STEP_SUMMARY"
+          tail -n 30 install.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || echo "(no install.log)"
+          echo "### build.log error / fatal lines" >> "$GITHUB_STEP_SUMMARY"
+          grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory|'UIKit|'Vision" build.log 2>/dev/null | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### last 70 lines of build.log" >> "$GITHUB_STEP_SUMMARY"
-          tail -n 70 build.log >> "$GITHUB_STEP_SUMMARY"
-          # Also echo to the live log for quick copy-paste.
-          echo "================ BUILD ERROR SUMMARY (scheme: $SCHEME) ================"
-          grep -niE "error:|fatal error|undefined symbols|undefined symbol|ld: |clang: error|make\[|No such file or directory" build.log | head -80 || true
-          echo "------------------ build.log tail ------------------"
-          tail -n 70 build.log
+          echo "### build.log tail (last 60)" >> "$GITHUB_STEP_SUMMARY"
+          tail -n 60 build.log 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || echo "(no build.log — the build died before make ran, see install.log above)"
 
-      - name: Publish artifacts to ci-artifacts branch
+      # Always publish, even on total failure, so the human (who only has SSH,
+      # no API token) can fetch the logs from the ci-artifacts-<scheme> branch.
+      # Uses a dash (not a slash) in the branch name to avoid any per-ref
+      # protection / refspec quirks, and force-pushes an independent branch per
+      # scheme so the parallel matrix jobs never clobber each other.
+      - name: Publish artifacts to ci-artifacts-<scheme> branch
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
           git config user.email "ci@local"
           git config user.name "CI"
           mkdir -p artifacts
-          if [ -f build.log ]; then cp build.log "artifacts/ci-last-build-$SCHEME.log"; fi
-          if [ -f "out-rel/DYLuckyBag-$SCHEME.deb" ]; then cp "out-rel/DYLuckyBag-$SCHEME.deb" "artifacts/DYLuckyBag-$SCHEME.deb"; fi
-          if [ -f "out-dbg/DYLuckyBag-$SCHEME-debug.deb" ]; then cp "out-dbg/DYLuckyBag-$SCHEME-debug.deb" "artifacts/DYLuckyBag-$SCHEME-debug.deb"; fi
-          if ls artifacts/* >/dev/null 2>&1; then
-            # .gitignore contains "*.deb", so the .deb must be force-added or it
-            # is silently skipped and never reaches ci-artifacts (learned the
-            # hard way on the NextUp3 build).
-            git add -A -f artifacts
-            git commit -m "ci artifacts (${{ github.sha }} / $SCHEME)" || echo "nothing to commit"
-            # Not fatal: report the failure rather than aborting the job.
-            # Push to a per-scheme branch so the parallel matrix jobs do not
-            # clobber each other's artifacts (each job force-pushes HEAD:<ref>).
-            if ! git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git "HEAD:ci-artifacts/$SCHEME"; then
-              echo "WARNING: could not push ci-artifacts/$SCHEME — run 'git push' error above. (Settings > Actions > Workflow permissions must be Read and write; also check branch protection.)"
-            fi
+          [ -f install.log ] && cp install.log "artifacts/install-$SCHEME.log"
+          [ -f build.log ]    && cp build.log    "artifacts/build-$SCHEME.log"
+          [ -f "out-rel/DYLuckyBag-$SCHEME.deb" ]        && cp "out-rel/DYLuckyBag-$SCHEME.deb"        "artifacts/DYLuckyBag-$SCHEME.deb"
+          [ -f "out-dbg/DYLuckyBag-$SCHEME-debug.deb" ]  && cp "out-dbg/DYLuckyBag-$SCHEME-debug.deb"  "artifacts/DYLuckyBag-$SCHEME-debug.deb"
+          {
+            echo "scheme=$SCHEME sha=${{ github.sha }}"
+            echo "install.log: $([ -f install.log ] && echo present || echo MISSING)"
+            echo "build.log:   $([ -f build.log ]    && echo present || echo MISSING)"
+            echo "release deb: $([ -f out-rel/DYLuckyBag-$SCHEME.deb ] && echo present || echo MISSING)"
+            echo "debug deb:   $([ -f out-dbg/DYLuckyBag-$SCHEME-debug.deb ] && echo present || echo MISSING)"
+          } > artifacts/SUMMARY-$SCHEME.txt
+          git add -A -f artifacts
+          git commit -m "ci artifacts (${{ github.sha }} / $SCHEME)" || echo "nothing to commit"
+          if git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:ci-artifacts-$SCHEME"; then
+            echo "PUSH_OK ci-artifacts-$SCHEME"
           else
-            echo "no artifacts produced; nothing to publish"
+            echo "PUSH_FAILED ci-artifacts-$SCHEME — see the error above (check Settings > Actions > Workflow permissions = Read and write, and branch protection)."
           fi
 
       # Independent of repository write permissions, so this is the reliable
-      # delivery channel: downloadable straight from the run's page.
+      # delivery channel for the human via the run's page (needs no token).
       - name: Upload .deb packages
         if: always()
         uses: actions/upload-artifact@v4
@@ -114,12 +114,14 @@ jobs:
             out-dbg/DYLuckyBag-${{ matrix.scheme }}-debug.deb
           if-no-files-found: warn
 
-      - name: Upload build log
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ matrix.scheme }}
-          path: build.log
+          path: |
+            install.log
+            build.log
           if-no-files-found: warn
 
       # The build step uses continue-on-error so it always emits a log; this
