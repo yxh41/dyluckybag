@@ -63,10 +63,35 @@ jobs:
             # hard way on the NextUp3 build).
             git add -A -f artifacts
             git commit -m "ci artifacts (${{ github.sha }})" || echo "nothing to commit"
-            git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts
+            # Not fatal: on a private repo whose Actions permissions are left at
+            # read-only, this push is rejected. The upload-artifact steps below
+            # do not need write permissions and still deliver the packages, so
+            # report the failure rather than aborting the job.
+            git push --force https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:ci-artifacts \
+              || echo "WARNING: could not push ci-artifacts (check Settings > Actions > Workflow permissions)"
           else
             echo "no artifacts produced; nothing to publish"
           fi
+
+      # Independent of repository write permissions, so this is the reliable
+      # delivery channel: downloadable straight from the run's page.
+      - name: Upload .deb packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dyluckybag-debs
+          path: |
+            out-rel/DYLuckyBag.deb
+            out-dbg/DYLuckyBag-debug.deb
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
 
       # The build step uses continue-on-error so it always emits a log; this
       # step makes the run's conclusion reflect whether a .deb actually came out.
