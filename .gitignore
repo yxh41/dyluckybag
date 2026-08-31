@@ -7,4 +7,5 @@ theos/
 out-rel/
 out-dbg/
 artifacts/
+output/
 .DS_Store

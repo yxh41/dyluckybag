@@ -5,8 +5,12 @@
 #import <objc/runtime.h>
 #import <QuartzCore/QuartzCore.h>
 
-static const CGFloat kFloatSize = 60.0;
-static const CGFloat kPanelHeight = 452.0;
+static const CGFloat kFloatSize   = 60.0;
+static const CGFloat kPanelMargin = 14.0;
+static const CGFloat kGrabberH    = 22.0;   // drag handle strip
+static const CGFloat kHeaderH     = 46.0;   // title + 收起 / 隐藏
+static const CGFloat kCorner      = 22.0;
+static const CGFloat kRowH        = 44.0;
 
 // Festive palette: red -> deep red gradient with a gold rim.
 #define DY_RED1  [UIColor colorWithRed:1.00 green:0.36 blue:0.36 alpha:1.0]
@@ -15,10 +19,13 @@ static const CGFloat kPanelHeight = 452.0;
 #define DY_CARD  [UIColor colorWithWhite:1.0 alpha:0.08]
 #define DY_SEP   [UIColor colorWithWhite:1.0 alpha:0.10]
 
-@interface DYPanel ()
+@interface DYPanel () <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UIButton *floatButton;
 @property (nonatomic, strong) UIView *panelView;
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UIButton *collapseButton;
+@property (nonatomic, strong) UIButton *hideButton;
 @property (nonatomic, readwrite) BOOL visible;
 @property (nonatomic) BOOL panelExpanded;
 
@@ -27,10 +34,30 @@ static const CGFloat kPanelHeight = 452.0;
 @property (nonatomic, strong) UILabel *joinLabel;
 @property (nonatomic, strong) UILabel *winLabel;
 @property (nonatomic, strong) UILabel *roomLabel;
+
+// Private layout helpers, declared up front so -Werror never trips on a
+// forward reference inside the @implementation.
+- (UIWindowScene *)activeWindowScene;
+- (UIEdgeInsets)hostSafeAreaInsets;
+- (void)clampOverlayToScreen;
+- (CGPoint)clampPanelCenter:(CGPoint)center;
+- (CGFloat)buildPanelContentInView:(UIView *)content width:(CGFloat)width;
+- (UILabel *)addStatAtX:(CGFloat)x
+                      y:(CGFloat)y
+                  width:(CGFloat)width
+               caption:(NSString *)caption
+               toPanel:(UIView *)panel;
+- (CGFloat)addToggleWithTitle:(NSString *)title
+                            y:(CGFloat)y
+                       toView:(UIView *)container
+                       getter:(SEL)getter
+                       setter:(SEL)setter;
+- (void)handlePanelPan:(UIPanGestureRecognizer *)pan;
 @end
 
 @interface DYPassThroughView : UIView
 @end
+
 @implementation DYPassThroughView
 // Let touches fall through to Douyin's own views in the transparent areas, so
 // the floating overlay never steals scroll / tap gestures from the feed or the
@@ -38,6 +65,30 @@ static const CGFloat kPanelHeight = 452.0;
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     return (hit == self) ? nil : hit;
+}
+@end
+
+#pragma mark - Overlay window
+
+// THE reason the overlay still blocked Douyin: a root view that returns nil from
+// hitTest: is not enough. UIView's hitTest: walks its subviews and, when none of
+// them claims the point, **falls back to returning self**. Applied to a window,
+// that means the UIWindow itself became the hit view for every transparent pixel
+// and swallowed the touch — the pass-through root view never got a say.
+//
+// Overriding hitTest: on the window itself is what actually releases those
+// touches: returning nil here makes UIKit deliver them to the host app's own
+// window underneath, so scrolling / tapping / the video player keep working.
+@interface DYOverlayWindow : UIWindow
+@end
+
+@implementation DYOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self || hit == self.rootViewController.view) {
+        return nil;   // transparent area -> let Douyin handle it
+    }
+    return hit;       // the 福 button, the panel or one of its controls
 }
 @end
 
@@ -61,6 +112,7 @@ static const CGFloat kPanelHeight = 452.0;
     [self buildIfNeeded];
     self.window.hidden = NO;
     self.visible = YES;
+    [self clampOverlayToScreen];
     DYLog(@"panel shown");
 }
 
@@ -74,16 +126,26 @@ static const CGFloat kPanelHeight = 452.0;
 /// "收起": collapse the panel but keep the floating 福 button on screen, so the
 /// user can bring the panel back with a single tap — no app restart needed.
 - (void)collapse {
+    if (!self.panelView || self.panelView.hidden) {
+        self.panelExpanded = NO;
+        return;
+    }
     self.panelExpanded = NO;
+
+    CGRect resting = self.panelView.frame;
     [UIView animateWithDuration:0.22
                      animations:^{
         self.panelView.alpha = 0.0;
-        CGRect f = self.panelView.frame;
+        CGRect f = resting;
         f.origin.y += 24.0;
         self.panelView.frame = f;
     }
                      completion:^(BOOL finished) {
         self.panelView.hidden = YES;
+        self.panelView.alpha = 1.0;
+        // Restore the resting frame: the slide-down is only an animation, so
+        // repeated collapses must not walk the panel off the bottom of the screen.
+        self.panelView.frame = resting;
     }];
 }
 
@@ -131,27 +193,22 @@ static const CGFloat kPanelHeight = 452.0;
 
     CGRect screen = UIScreen.mainScreen.bounds;
 
-    UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = [self activeWindowScene];
-        if (scene) {
-            window = [[UIWindow alloc] initWithWindowScene:scene];
-        }
+    DYOverlayWindow *window = nil;
+    UIWindowScene *scene = [self activeWindowScene];
+    if (scene) {
+        window = [[DYOverlayWindow alloc] initWithWindowScene:scene];
     }
     if (!window) {
-        window = [[UIWindow alloc] initWithFrame:screen];
+        window = [[DYOverlayWindow alloc] initWithFrame:screen];
     }
 
     window.frame = screen;
-    // Above alert level so Douyin's own sheets never cover it, but below the
-    // status bar so it does not look like a system overlay.
+    // Above alert level so Douyin's own sheets never cover it.
     window.windowLevel = UIWindowLevelAlert + 1.0;
     window.backgroundColor = [UIColor clearColor];
     window.userInteractionEnabled = YES;
 
     UIViewController *root = [[UIViewController alloc] init];
-    // A pass-through root view so the transparent overlay does not swallow
-    // Douyin's gestures; only the floating button and panel are interactive.
     DYPassThroughView *rootView = [[DYPassThroughView alloc] initWithFrame:screen];
     rootView.backgroundColor = [UIColor clearColor];
     rootView.userInteractionEnabled = YES;
@@ -182,10 +239,18 @@ static const CGFloat kPanelHeight = 452.0;
      selector:@selector(handleAppBecameActive)
      name:UIApplicationDidBecomeActiveNotification
      object:nil];
+
+    // Keep the button and the panel inside the visible area after a rotation.
+    // Orientation notifications are opt-in: without this call the observer below
+    // would simply never fire.
+    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+    [[NSNotificationCenter defaultCenter]
+     addObserver:self
+     selector:@selector(clampOverlayToScreen)
+     name:UIDeviceOrientationDidChangeNotification
+     object:nil];
 }
 
-// No availability attribute needed: the deployment target is iOS 15, so
-// UIWindowScene and -initWithWindowScene: are always present.
 - (UIWindowScene *)activeWindowScene {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive &&
@@ -194,6 +259,63 @@ static const CGFloat kPanelHeight = 452.0;
         }
     }
     return nil;
+}
+
+/// Safe area of the host app's own window — used to keep the panel clear of the
+/// notch / home indicator instead of guessing with hardcoded insets.
+- (UIEdgeInsets)hostSafeAreaInsets {
+    UIWindowScene *scene = [self activeWindowScene];
+    for (UIWindow *candidate in scene.windows) {
+        if (candidate.isKeyWindow) {
+            return candidate.safeAreaInsets;
+        }
+    }
+    return UIEdgeInsetsZero;
+}
+
+/// Keeps both overlay elements fully on screen (called on show and on rotation).
+- (void)clampOverlayToScreen {
+    if (!self.window) {
+        return;
+    }
+
+    CGRect bounds = UIScreen.mainScreen.bounds;
+    UIEdgeInsets insets = [self hostSafeAreaInsets];
+
+    self.window.frame = bounds;
+    self.window.rootViewController.view.frame = bounds;
+
+    if (self.floatButton) {
+        CGPoint center = self.floatButton.center;
+        CGFloat half = kFloatSize / 2.0;
+        center.x = MIN(MAX(center.x, half + 4.0), bounds.size.width - half - 4.0);
+        center.y = MIN(MAX(center.y, insets.top + half), bounds.size.height - insets.bottom - half);
+        self.floatButton.center = center;
+    }
+
+    if (self.panelView && !self.panelView.hidden) {
+        self.panelView.center = [self clampPanelCenter:self.panelView.center];
+    }
+}
+
+- (CGPoint)clampPanelCenter:(CGPoint)center {
+    CGRect bounds = UIScreen.mainScreen.bounds;
+    UIEdgeInsets insets = [self hostSafeAreaInsets];
+    CGSize size = self.panelView.bounds.size;
+
+    CGFloat minX = kPanelMargin + size.width / 2.0;
+    CGFloat maxX = bounds.size.width - kPanelMargin - size.width / 2.0;
+    CGFloat minY = insets.top + 12.0 + size.height / 2.0;
+    CGFloat maxY = bounds.size.height - insets.bottom - 12.0 - size.height / 2.0;
+    // On very small screens the panel can be taller than the usable area; keep
+    // its top edge reachable rather than letting the clamp invert.
+    if (minY > maxY) {
+        minY = maxY;
+    }
+
+    center.x = MIN(MAX(center.x, minX), maxX);
+    center.y = MIN(MAX(center.y, minY), maxY);
+    return center;
 }
 
 #pragma mark - Floating button
@@ -272,10 +394,10 @@ static const CGFloat kPanelHeight = 452.0;
     if (self.panelExpanded) {
         self.panelView.hidden = NO;
         self.panelView.alpha = 0.0;
-        CGRect f = self.panelView.frame;
-        CGFloat finalY = f.origin.y;
-        f.origin.y += 24.0;
-        self.panelView.frame = f;
+        CGRect resting = self.panelView.frame;
+        CGRect from = resting;
+        from.origin.y += 24.0;
+        self.panelView.frame = from;
         [UIView animateWithDuration:0.26
                               delay:0.0
              usingSpringWithDamping:0.8
@@ -283,7 +405,7 @@ static const CGFloat kPanelHeight = 452.0;
                             options:0
                          animations:^{
             self.panelView.alpha = 1.0;
-            self.panelView.frame = CGRectMake(f.origin.x, finalY, f.size.width, f.size.height);
+            self.panelView.frame = resting;
         }
                          completion:nil];
         [self refresh];
@@ -301,9 +423,10 @@ static const CGFloat kPanelHeight = 452.0;
 
     // Keep the button fully on screen.
     CGRect bounds = UIScreen.mainScreen.bounds;
+    UIEdgeInsets insets = [self hostSafeAreaInsets];
     CGFloat half = kFloatSize / 2.0;
-    center.x = MIN(MAX(center.x, half), bounds.size.width - half);
-    center.y = MIN(MAX(center.y, half), bounds.size.height - half);
+    center.x = MIN(MAX(center.x, half + 4.0), bounds.size.width - half - 4.0);
+    center.y = MIN(MAX(center.y, insets.top + half), bounds.size.height - insets.bottom - half);
 
     pan.view.center = center;
     [pan setTranslation:CGPointZero inView:pan.view.superview];
@@ -313,13 +436,28 @@ static const CGFloat kPanelHeight = 452.0;
 
 - (void)buildPanelInView:(UIView *)superview {
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat width = screen.size.width - 28.0;
-    CGFloat x = 14.0;
-    CGFloat y = screen.size.height - kPanelHeight - 24.0;
+    UIEdgeInsets insets = [self hostSafeAreaInsets];
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, width, kPanelHeight)];
+    CGFloat width = screen.size.width - kPanelMargin * 2.0;
+    CGFloat chromeH = kGrabberH + kHeaderH;
+    CGFloat topLimit = insets.top + 12.0;
+    CGFloat bottomLimit = screen.size.height - insets.bottom - 12.0;
+
+    // Build the scrolling content first so the panel can size itself to it
+    // instead of clipping whatever does not fit (the old fixed 452pt frame cut
+    // off the last two switches).
+    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, 0.0)];
+    CGFloat contentH = [self buildPanelContentInView:content width:width];
+    content.frame = CGRectMake(0.0, 0.0, width, contentH);
+
+    CGFloat maxScrollH = MAX(140.0, (bottomLimit - topLimit) - chromeH);
+    CGFloat scrollH = MIN(contentH, maxScrollH);
+    CGFloat height = chromeH + scrollH;
+    CGFloat y = bottomLimit - height;
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(kPanelMargin, y, width, height)];
     panel.backgroundColor = [UIColor clearColor];
-    panel.layer.cornerRadius = 22.0;
+    panel.layer.cornerRadius = kCorner;
     panel.layer.borderWidth = 1.0;
     panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
     panel.layer.masksToBounds = YES;
@@ -328,46 +466,60 @@ static const CGFloat kPanelHeight = 452.0;
     // Frosted dark gradient background.
     CAGradientLayer *bg = [CAGradientLayer layer];
     bg.frame = panel.bounds;
-    bg.cornerRadius = 22.0;
+    bg.cornerRadius = kCorner;
     bg.colors = @[ (__bridge id)[UIColor colorWithRed:0.13 green:0.13 blue:0.17 alpha:0.97].CGColor,
                    (__bridge id)[UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.98].CGColor ];
     bg.startPoint = CGPointMake(0.0, 0.0);
     bg.endPoint = CGPointMake(0.0, 1.0);
     [panel.layer insertSublayer:bg atIndex:0];
 
-    CGFloat cursor = 16.0;
+    // Drag handle: a grabber pill that signals "this panel moves".
+    UIView *grabber = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, kGrabberH)];
+    grabber.backgroundColor = [UIColor clearColor];
+    [panel addSubview:grabber];
+
+    UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(width / 2.0 - 20.0, 7.0, 40.0, 4.0)];
+    pill.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.28];
+    pill.layer.cornerRadius = 2.0;
+    [grabber addSubview:pill];
+
+    // Header stays pinned above the scroll view so 收起 / 隐藏 are always reachable.
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0.0, kGrabberH, width, kHeaderH)];
+    header.backgroundColor = [UIColor clearColor];
+    [panel addSubview:header];
+
     CGFloat innerWidth = width - 28.0;
 
-    // Header: title + small red badge dot + subtitle.
-    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor + 5.0, 9.0, 9.0)];
+    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(16.0, 7.0, 9.0, 9.0)];
     dot.backgroundColor = DY_RED1;
     dot.layer.cornerRadius = 4.5;
-    [panel addSubview:dot];
+    [header addSubview:dot];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(32.0, cursor, innerWidth - 100.0, 20.0)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(32.0, 2.0, innerWidth - 120.0, 20.0)];
     title.text = @"抖音福袋助手";
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:17.0];
-    [panel addSubview:title];
+    [header addSubview:title];
 
-    UILabel *subtitle = [[UILabel alloc] initWithFrame:CGRectMake(32.0, cursor + 20.0, innerWidth - 100.0, 16.0)];
+    UILabel *subtitle = [[UILabel alloc] initWithFrame:CGRectMake(32.0, 21.0, innerWidth - 120.0, 16.0)];
     subtitle.text = @"OCR 自动参与福袋";
     subtitle.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
     subtitle.font = [UIFont systemFontOfSize:11.0];
-    [panel addSubview:subtitle];
+    [header addSubview:subtitle];
 
     UIButton *collapseButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    collapseButton.frame = CGRectMake(width - 100.0, cursor, 44.0, 28.0);
+    collapseButton.frame = CGRectMake(width - 104.0, 7.0, 46.0, 30.0);
     [collapseButton setTitle:@"收起" forState:UIControlStateNormal];
     [collapseButton setTitleColor:DY_GOLD forState:UIControlStateNormal];
     collapseButton.titleLabel.font = [UIFont systemFontOfSize:14.0];
     [collapseButton addTarget:self
                        action:@selector(collapse)
              forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:collapseButton];
+    [header addSubview:collapseButton];
+    self.collapseButton = collapseButton;
 
     UIButton *hideButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    hideButton.frame = CGRectMake(width - 54.0, cursor, 44.0, 28.0);
+    hideButton.frame = CGRectMake(width - 56.0, 7.0, 46.0, 30.0);
     [hideButton setTitle:@"隐藏" forState:UIControlStateNormal];
     [hideButton setTitleColor:[UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:1.0]
                      forState:UIControlStateNormal];
@@ -375,15 +527,45 @@ static const CGFloat kPanelHeight = 452.0;
     [hideButton addTarget:self
                    action:@selector(hide)
          forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:hideButton];
+    [header addSubview:hideButton];
+    self.hideButton = hideButton;
 
-    cursor += 46.0;
+    UIView *headerLine = [[UIView alloc] initWithFrame:CGRectMake(0.0, chromeH - 1.0, width, 1.0)];
+    headerLine.backgroundColor = DY_SEP;
+    [panel addSubview:headerLine];
+
+    UIScrollView *scroll =
+        [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, chromeH, width, scrollH)];
+    scroll.contentSize = CGSizeMake(width, contentH);
+    scroll.backgroundColor = [UIColor clearColor];
+    scroll.showsVerticalScrollIndicator = YES;
+    scroll.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+    scroll.alwaysBounceVertical = NO;
+    [scroll addSubview:content];
+    [panel addSubview:scroll];
+    self.scrollView = scroll;
+
+    // Drag the panel by its grabber / header only, so the switches, the
+    // segmented control and the scroll view keep their own gestures.
+    UIPanGestureRecognizer *panelPan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanelPan:)];
+    panelPan.delegate = self;
+    [panel addGestureRecognizer:panelPan];
+
+    [superview addSubview:panel];
+    self.panelView = panel;
+}
+
+/// Lays out the scrollable body of the panel and returns its full height.
+- (CGFloat)buildPanelContentInView:(UIView *)content width:(CGFloat)width {
+    CGFloat innerWidth = width - 28.0;
+    CGFloat cursor = 6.0;
 
     // Status pill.
     UIView *statusCard = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor, innerWidth, 40.0)];
     statusCard.backgroundColor = DY_CARD;
     statusCard.layer.cornerRadius = 12.0;
-    [panel addSubview:statusCard];
+    [content addSubview:statusCard];
 
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(14.0, 0.0, innerWidth - 28.0, 40.0)];
     status.textColor = [UIColor colorWithWhite:0.86 alpha:1.0];
@@ -400,26 +582,26 @@ static const CGFloat kPanelHeight = 452.0;
                                     y:cursor
                                 width:statWidth
                               caption:@"今日参与"
-                             toPanel:panel];
+                             toPanel:content];
     self.winLabel = [self addStatAtX:16.0 + statWidth + 8.0
                                     y:cursor
                                 width:statWidth
                               caption:@"今日中奖"
-                             toPanel:panel];
+                             toPanel:content];
     self.roomLabel = [self addStatAtX:16.0 + (statWidth + 8.0) * 2.0
                                      y:cursor
                                  width:statWidth
                                caption:@"巡逻房间"
-                              toPanel:panel];
+                              toPanel:content];
 
     cursor += 64.0;
 
     // Master switch row.
-    UIView *masterRow = [[UIView alloc] initWithFrame:CGRectMake(0.0, cursor, width, 44.0)];
-    [panel addSubview:masterRow];
+    UIView *masterRow = [[UIView alloc] initWithFrame:CGRectMake(0.0, cursor, width, kRowH)];
+    [content addSubview:masterRow];
 
     UILabel *masterLabel = [[UILabel alloc]
-        initWithFrame:CGRectMake(16.0, 0.0, innerWidth - 70.0, 44.0)];
+        initWithFrame:CGRectMake(16.0, 0.0, innerWidth - 70.0, kRowH)];
     masterLabel.text = @"总开关";
     masterLabel.textColor = [UIColor whiteColor];
     masterLabel.font = [UIFont systemFontOfSize:15.0];
@@ -427,7 +609,7 @@ static const CGFloat kPanelHeight = 452.0;
 
     UISwitch *masterSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
     masterSwitch.center = CGPointMake(width - 16.0 - masterSwitch.frame.size.width / 2.0,
-                                      22.0);
+                                      kRowH / 2.0);
     masterSwitch.onTintColor = DY_RED2;
     masterSwitch.on = [DYConfig shared].masterEnabled;
     [masterSwitch addTarget:self
@@ -435,12 +617,12 @@ static const CGFloat kPanelHeight = 452.0;
            forControlEvents:UIControlEventValueChanged];
     [masterRow addSubview:masterSwitch];
 
-    cursor += 44.0;
+    cursor += kRowH;
 
     // Section separator.
     UIView *sep1 = [[UIView alloc] initWithFrame:CGRectMake(16.0, cursor, innerWidth, 1.0)];
     sep1.backgroundColor = DY_SEP;
-    [panel addSubview:sep1];
+    [content addSubview:sep1];
     cursor += 10.0;
 
     // Patrol mode label.
@@ -448,7 +630,7 @@ static const CGFloat kPanelHeight = 452.0;
     modeLabel.text = @"巡逻模式";
     modeLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
     modeLabel.font = [UIFont systemFontOfSize:12.0];
-    [panel addSubview:modeLabel];
+    [content addSubview:modeLabel];
     cursor += 24.0;
 
     UISegmentedControl *segmented =
@@ -462,38 +644,38 @@ static const CGFloat kPanelHeight = 452.0;
     [segmented addTarget:self
                   action:@selector(patrolModeChanged:)
         forControlEvents:UIControlEventValueChanged];
-    [panel addSubview:segmented];
+    [content addSubview:segmented];
     cursor += 44.0;
 
     // Feature switches.
     cursor = [self addToggleWithTitle:@"超级福袋 · 自动参与"
                                     y:cursor
-                               toView:panel
+                               toView:content
                               getter:@selector(superBagAutoJoin)
                               setter:@selector(setSuperBagAutoJoin:)];
     cursor = [self addToggleWithTitle:@"普通福袋 · 自动参与"
                                     y:cursor
-                               toView:panel
+                               toView:content
                               getter:@selector(normalBagAutoJoin)
                               setter:@selector(setNormalBagAutoJoin:)];
     cursor = [self addToggleWithTitle:@"评论口令自动发送"
                                     y:cursor
-                               toView:panel
+                               toView:content
                               getter:@selector(commentKeywordAutoSend)
                               setter:@selector(setCommentKeywordAutoSend:)];
     cursor = [self addToggleWithTitle:@"直播间自动巡逻"
                                     y:cursor
-                               toView:panel
+                               toView:content
                               getter:@selector(autoPatrol)
                               setter:@selector(setAutoPatrol:)];
     cursor = [self addToggleWithTitle:@"中奖横幅提醒"
                                     y:cursor
-                               toView:panel
+                               toView:content
                               getter:@selector(winBannerAlert)
                               setter:@selector(setWinBannerAlert:)];
 
-    [superview addSubview:panel];
-    self.panelView = panel;
+    cursor += 10.0;   // breathing room below the last row
+    return cursor;
 }
 
 - (UILabel *)addStatAtX:(CGFloat)x
@@ -562,7 +744,47 @@ static const CGFloat kPanelHeight = 452.0;
     label.font = [UIFont systemFontOfSize:14.0];
     [container addSubview:label];
 
-    return y + 44.0;
+    return y + kRowH;
+}
+
+#pragma mark - Panel dragging
+
+// Only let a drag start on the grabber / header strip, and never on top of the
+// 收起 / 隐藏 buttons — otherwise the pan would swallow their taps.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
+    if (!self.panelView) {
+        return YES;
+    }
+
+    CGPoint point = [gesture locationInView:self.panelView];
+    if (point.y > kGrabberH + kHeaderH) {
+        return NO;   // content area: switches / segmented / scroll keep the touch
+    }
+
+    if (self.collapseButton) {
+        CGRect rect = [self.panelView convertRect:self.collapseButton.bounds
+                                         fromView:self.collapseButton];
+        if (CGRectContainsPoint(rect, point)) {
+            return NO;
+        }
+    }
+    if (self.hideButton) {
+        CGRect rect = [self.panelView convertRect:self.hideButton.bounds
+                                         fromView:self.hideButton];
+        if (CGRectContainsPoint(rect, point)) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (void)handlePanelPan:(UIPanGestureRecognizer *)pan {
+    CGPoint translation = [pan translationInView:self.panelView.superview];
+    CGPoint center = self.panelView.center;
+    center.x += translation.x;
+    center.y += translation.y;
+    self.panelView.center = [self clampPanelCenter:center];
+    [pan setTranslation:CGPointZero inView:self.panelView.superview];
 }
 
 #pragma mark - Actions
