@@ -745,6 +745,20 @@ static const CGFloat kRowH        = 44.0;
                               getter:@selector(winBannerAlert)
                               setter:@selector(setWinBannerAlert:)];
 
+    // Reset today's counters — clears inflation left by earlier buggy runs
+    // (e.g. the pre-fix false-positive joins) so the stats start clean.
+    UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    resetBtn.frame = CGRectMake(16.0, cursor, innerWidth, 40.0);
+    [resetBtn setTitle:@"重置今日计数" forState:UIControlStateNormal];
+    resetBtn.tintColor = DY_RED2;
+    resetBtn.backgroundColor = DY_CARD;
+    resetBtn.layer.cornerRadius = 10.0;
+    [resetBtn addTarget:self
+                  action:@selector(resetStatsTapped:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [content addSubview:resetBtn];
+    cursor += 50.0;
+
     cursor += 10.0;   // breathing room below the last row
     return cursor;
 }
@@ -902,6 +916,14 @@ static const CGFloat kRowH        = 44.0;
 
     [config synchronize];
     DYLog(@"toggle %@ -> %@", setterName, sender.on ? @"ON" : @"OFF");
+}
+
+- (void)resetStatsTapped:(UIButton *)sender {
+    [[DYConfig shared] resetTodayStats];
+    [[DYConfig shared] synchronize];
+    [self refresh];
+    self.statusLabel.text = @"已重置今日计数";
+    DYLog(@"panel: reset today's stats");
 }
 
 - (void)handleWinNotification:(NSNotification *)note {
