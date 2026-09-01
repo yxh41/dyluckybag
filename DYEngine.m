@@ -408,21 +408,33 @@ static const NSInteger kQuietThreshold = 10;
 }
 
 /// Writes `text` into a UITextField / UITextView and notifies the host app's
-/// change handlers so the 发送 button enables (setting .text alone is not
-/// enough — Douyin keys off the editing-changed event / delegate callback).
+/// change handlers so the 发送 button enables. Setting .text alone is not
+/// enough: Douyin may key off either the control's editing-changed action OR
+/// the delegate callback, so we fire both. The delegate call goes through
+/// performSelector: because -Werror rejects a direct -textFieldDidChange:
+/// (the selector is not visible on this SDK's delegate protocol type).
 - (void)fillInput:(UIView *)view withText:(NSString *)text {
     if ([view isKindOfClass:UITextField.class]) {
         UITextField *tf = (UITextField *)view;
         tf.text = text;
-        if ([tf.delegate respondsToSelector:@selector(textFieldDidChange:)]) {
-            [tf.delegate textFieldDidChange:tf];
-        }
         [tf sendActionsForControlEvents:UIControlEventEditingChanged];
+        id delegate = tf.delegate;
+        if ([delegate respondsToSelector:@selector(textFieldDidChange:)]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [delegate performSelector:@selector(textFieldDidChange:) withObject:tf];
+            #pragma clang diagnostic pop
+        }
     } else if ([view isKindOfClass:UITextView.class]) {
         UITextView *tv = (UITextView *)view;
         tv.text = text;
-        if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)]) {
-            [tv.delegate textViewDidChange:tv];
+        [tv sendActionsForControlEvents:UIControlEventEditingChanged];
+        id delegate = tv.delegate;
+        if ([delegate respondsToSelector:@selector(textViewDidChange:)]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [delegate performSelector:@selector(textViewDidChange:) withObject:tv];
+            #pragma clang diagnostic pop
         }
     }
     DYLog(@"filled comment input with %lu chars", (unsigned long)text.length);
