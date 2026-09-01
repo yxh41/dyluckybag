@@ -1,6 +1,19 @@
 #import "DYOCRDetector.h"
 #import "DYLog.h"
 #import <Vision/Vision.h>
+#import <QuartzCore/QuartzCore.h>
+
+/// Vision frequently splits CJK runs into separate glyphs ("福 袋"). Compare on
+/// a whitespace-stripped copy so a single stray space cannot hide the bag.
+static NSString *DYCompactText(NSString *text) {
+    if (text.length == 0) {
+        return @"";
+    }
+    NSArray<NSString *> *parts =
+        [text componentsSeparatedByCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [parts componentsJoinedByString:@""];
+}
 
 @implementation DYTextHit
 
@@ -39,7 +52,15 @@ static dispatch_queue_t DYOCRQueue(void) {
 - (UIWindow *)frontWindow {
     UIApplication *app = UIApplication.sharedApplication;
 
+    // Never capture our own overlay. It floats above Douyin at alert level and
+    // holds nothing but the 福 button and the panel, so pointing the OCR at it
+    // would silently produce a near-empty screen.
+    BOOL (^isOverlay)(UIWindow *) = ^BOOL(UIWindow *window) {
+        return window.windowLevel >= UIWindowLevelAlert;
+    };
+
     if (@available(iOS 13.0, *)) {
+        UIWindow *fallback = nil;
         for (UIScene *scene in app.connectedScenes) {
             if (scene.activationState != UISceneActivationStateForegroundActive) {
                 continue;
@@ -48,17 +69,33 @@ static dispatch_queue_t DYOCRQueue(void) {
                 continue;
             }
             for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (window.isKeyWindow && window.bounds.size.width > 0) {
+                if (window.hidden || window.bounds.size.width <= 0) {
+                    continue;
+                }
+                if (isOverlay(window)) {
+                    continue;
+                }
+                if (window.isKeyWindow) {
                     return window;
                 }
+                if (!fallback) {
+                    fallback = window;
+                }
             }
+        }
+        if (fallback) {
+            return fallback;
         }
     }
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return app.keyWindow;
+    UIWindow *legacy = app.keyWindow;
 #pragma clang diagnostic pop
+    if (legacy && !legacy.hidden && !isOverlay(legacy)) {
+        return legacy;
+    }
+    return nil;
 }
 
 #pragma mark - Screen capture
@@ -76,23 +113,77 @@ static dispatch_queue_t DYOCRQueue(void) {
         return nil;
     }
 
-    // scale = 1 keeps the OCR pass cheap; we only need text positions, and the
-    // Vision request is the bottleneck, not the rasterisation.
+    // scale = 2 hands Vision roughly twice the pixels per glyph. The 福袋
+    // capsule is only about 12pt tall; at scale 1 that is so few pixels that the
+    // recogniser either skips it or reads it as noise. Coordinates are returned
+    // normalised by Vision, so raising the scale does not shift any hit rects.
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-    format.scale = 1.0;
+    format.scale = 2.0;
     format.opaque = YES;
+
+    __block BOOL hierarchyOK = NO;
 
     UIGraphicsImageRenderer *renderer =
         [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
 
     UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        BOOL ok = [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
-        if (!ok) {
-            DYLog(@"drawViewHierarchyInRect returned NO (no backing layer?)");
+        hierarchyOK = [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
+        if (hierarchyOK) {
+            return;
+        }
+
+        // Live rooms are the problem case: Douyin renders video through
+        // Metal / AV layers that have no CPU backing store, and
+        // drawViewHierarchyInRect refuses those outright (returns NO). That is
+        // why every capture taken inside a live room came back with zero hits
+        // while captures in the feed worked fine.
+        //
+        // renderInContext: walks the layer tree instead. The video surface comes
+        // out blank, but every UILabel and UIButton — including the 福袋 capsule
+        // and the 参与 button — is Quartz-drawn and renders perfectly. Blank
+        // video costs us nothing because we only ever read text.
+        @try {
+            [window.layer renderInContext:context.CGContext];
+        } @catch (NSException *exception) {
+            DYLog(@"layer render failed: %@", exception.reason);
         }
     }];
 
+    if (!hierarchyOK) {
+        DYLog(@"hierarchy capture failed -> used layer render fallback");
+        [self logWindowDiagnostics:window];
+    }
+
     return image;
+}
+
+/// Emitted (rate limited) whenever the fast capture path fails, so a log from a
+/// live room explains itself instead of just reporting zero hits.
+- (void)logWindowDiagnostics:(UIWindow *)window {
+    static CFTimeInterval lastDiagnostic = 0.0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastDiagnostic < 30.0) {
+        return;
+    }
+    lastDiagnostic = now;
+
+    UIApplicationState state = UIApplication.sharedApplication.applicationState;
+    NSString *stateName = @[ @"active", @"inactive", @"background" ][MIN((int)state, 2)];
+
+    NSInteger windowCount = 0;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:UIWindowScene.class]) {
+                windowCount += ((UIWindowScene *)scene).windows.count;
+            }
+        }
+    }
+
+    DYLog(@"capture diag: appState=%@ window=%@ key=%d hidden=%d alpha=%.2f "
+          @"level=%.0f bounds=%@ windows=%ld screen=%@",
+          stateName, NSStringFromClass(window.class), window.isKeyWindow, window.hidden,
+          window.alpha, window.windowLevel, NSStringFromCGRect(window.bounds),
+          (long)windowCount, NSStringFromCGSize(UIScreen.mainScreen.bounds.size));
 }
 
 #pragma mark - OCR
@@ -139,6 +230,7 @@ static dispatch_queue_t DYOCRQueue(void) {
                 DYLog(@"OCR error: %@", error.localizedDescription);
             } else {
                 DYLog(@"OCR produced %lu hits", (unsigned long)hits.count);
+                [self logHits:hits];
             }
 
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -148,15 +240,26 @@ static dispatch_queue_t DYOCRQueue(void) {
             });
         }];
 
-    // Fast level + no language correction keeps a full-screen pass well under
-    // 100 ms, which matters because we scan roughly once a second.
-    request.recognitionLevel = VNRequestTextRecognitionLevelFast;
+    // Accurate instead of fast, and a much lower minimum glyph height: the 福袋
+    // capsule sits far below Vision's default minimum (roughly 1/32 of the image
+    // height), so on the fast path it was being skipped entirely — the OCR was
+    // reporting hits from the big UI text while never once seeing the bag. The
+    // scan runs on a background queue every few seconds, so the extra cost is
+    // invisible to the user.
+    request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
     request.usesLanguageCorrection = NO;
     // zh-Hans covers Douyin's Chinese UI chrome, en-US the numeric countdowns.
     // recognitionLanguages exists since iOS 13, so no availability guard is
     // needed against this project's iOS 15 deployment target — guarding it at
     // iOS 16 would have silently left the recogniser on the default locale.
     request.recognitionLanguages = @[ @"zh-Hans", @"en-US" ];
+    // Note: the header documents this as pixels while the default (0) is known
+    // to scale with image size, i.e. it behaves like a fraction of image height.
+    // Measured against our capture: at scale 2 a 12pt glyph is ~24px tall in a
+    // ~1688px image, while the default threshold is ~1/32 of the height (~52px)
+    // — the capsule was invisible to Vision. 0.005 clears that bar under either
+    // reading of the unit.
+    request.minimumTextHeight = 0.005;
 
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
@@ -173,6 +276,26 @@ static dispatch_queue_t DYOCRQueue(void) {
             });
         }
     });
+}
+
+#pragma mark - Diagnostics
+
+/// Dump what the recogniser actually read. Without this a log can only ever say
+/// "N hits", which never explains why 福袋 was not among them.
+- (void)logHits:(NSArray<DYTextHit *> *)hits {
+    if (hits.count == 0) {
+        return;
+    }
+    NSMutableString *line = [NSMutableString stringWithString:@"OCR text:"];
+    NSUInteger limit = MIN(hits.count, (NSUInteger)30);
+    for (NSUInteger i = 0; i < limit; i++) {
+        DYTextHit *hit = hits[i];
+        [line appendFormat:@" [%@ @%d,%d c=%.2f]",
+            hit.text ?: @"",
+            (int)CGRectGetMidX(hit.rect), (int)CGRectGetMidY(hit.rect),
+            hit.confidence];
+    }
+    DYLog(@"%@", line);
 }
 
 #pragma mark - Coordinate conversion
@@ -201,7 +324,8 @@ static dispatch_queue_t DYOCRQueue(void) {
             continue;
         }
         DYTextHit *hit = (DYTextHit *)object;
-        if ([hit.text rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        if ([DYCompactText(hit.text) rangeOfString:DYCompactText(keyword)
+                                           options:NSCaseInsensitiveSearch].location != NSNotFound) {
             return hit;
         }
     }
@@ -218,7 +342,8 @@ static dispatch_queue_t DYOCRQueue(void) {
             continue;
         }
         DYTextHit *hit = (DYTextHit *)object;
-        if ([hit.text rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        if ([DYCompactText(hit.text) rangeOfString:DYCompactText(keyword)
+                                           options:NSCaseInsensitiveSearch].location != NSNotFound) {
             [matches addObject:hit];
         }
     }

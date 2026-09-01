@@ -53,6 +53,8 @@ static const CGFloat kRowH        = 44.0;
                        getter:(SEL)getter
                        setter:(SEL)setter;
 - (void)handlePanelPan:(UIPanGestureRecognizer *)pan;
+- (void)installHostGesture;
+- (void)handleHostLongPress:(UILongPressGestureRecognizer *)recognizer;
 @end
 
 @interface DYPassThroughView : UIView
@@ -90,6 +92,13 @@ static const CGFloat kRowH        = 44.0;
     }
     return hit;       // the 福 button, the panel or one of its controls
 }
+@end
+
+// Marker subclass so we can de-duplicate the re-show gesture we attach to the
+// host app's window (see -installHostGesture).
+@interface DYReshowLongPress : UILongPressGestureRecognizer
+@end
+@implementation DYReshowLongPress
 @end
 
 @implementation DYPanel
@@ -150,6 +159,9 @@ static const CGFloat kRowH        = 44.0;
 }
 
 - (void)handleAppBecameActive {
+    // The host app's window can be recreated across launches; make sure the
+    // re-show gesture is attached to the live window.
+    [self installHostGesture];
     if (!self.visible) {
         [self show];
     }
@@ -220,6 +232,10 @@ static const CGFloat kRowH        = 44.0;
     [self buildFloatButtonInView:root.view];
     [self buildPanelInView:root.view];
 
+    // Attach the host-side re-show gesture (three-finger long press) so a fully
+    // hidden overlay can still be brought back without leaving the app.
+    [self installHostGesture];
+
     // The engine drives the status line; keep it in sync without polling.
     __weak typeof(self) weakSelf = self;
     [DYEngine shared].onUpdate = ^(DYEngineState state, NSString *status) {
@@ -271,6 +287,56 @@ static const CGFloat kRowH        = 44.0;
         }
     }
     return UIEdgeInsetsZero;
+}
+
+/// Attaches a three-finger long press to Douyin's own window. Once the overlay
+/// is fully hidden there is no on-screen control left to bring it back, and the
+/// only other way out was backgrounding the app. The recogniser is deliberately
+/// passive: cancelsTouchesInView = NO means it never eats a touch, so the host
+/// app's own gestures keep working exactly as before.
+- (void)installHostGesture {
+    UIWindowScene *scene = [self activeWindowScene];
+    if (!scene) {
+        return;
+    }
+
+    for (UIWindow *window in scene.windows) {
+        // Skip our own overlay: the gesture belongs on the app underneath.
+        if (window == self.window || window.windowLevel >= UIWindowLevelAlert) {
+            continue;
+        }
+
+        // De-duplicate: buildIfNeeded and handleAppBecameActive both call in,
+        // and stacking recognisers would fire the handler N times per press.
+        // Copy before iterating: removing while enumerating a collection the
+        // view may still own is a mutation-during-enumeration crash waiting to
+        // happen inside somebody else's process.
+        for (UIGestureRecognizer *existing in [window.gestureRecognizers copy]) {
+            if ([existing isKindOfClass:DYReshowLongPress.class]) {
+                [window removeGestureRecognizer:existing];
+            }
+        }
+
+        DYReshowLongPress *press =
+            [[DYReshowLongPress alloc] initWithTarget:self
+                                              action:@selector(handleHostLongPress:)];
+        press.numberOfTouchesRequired = 3;
+        press.minimumPressDuration = 0.6;
+        press.cancelsTouchesInView = NO;
+        press.delaysTouchesEnded = NO;
+        [window addGestureRecognizer:press];
+    }
+}
+
+- (void)handleHostLongPress:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    if (self.visible) {
+        return;
+    }
+    DYLog(@"host three-finger press -> re-show overlay");
+    [self show];
 }
 
 /// Keeps both overlay elements fully on screen (called on show and on rotation).
