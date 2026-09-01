@@ -12,8 +12,13 @@
 static NSString *const kWordBag        = @"福袋";
 static NSString *const kWordJoin       = @"参与";
 static NSString *const kWordKeyword    = @"口令";
-static NSString *const kWordCongrats   = @"恭喜";
-static NSString *const kWordWon        = @"中奖";
+// A real win shows a dedicated popup ("恭喜你获得…", "你已中奖…"), not the
+// "恭喜主播 / 恭喜发财" people spam in chat. Match only win-modal phrases so the
+// win counter is not inflated by congratulatory chatter.
+static NSArray<NSString *> *const kWinPhrases = @[
+    @"你已中奖", @"恭喜你获得", @"恭喜你中奖", @"中奖通知",
+    @"中奖啦", @"获得¥", @"奖品已发放", @"中奖记录"
+];
 
 // A tap landing within this radius of the previous tap is treated as the same
 // button, so we do not hammer "join" on every scan pass.
@@ -160,9 +165,13 @@ static const NSInteger kQuietThreshold = 10;
 
     if (hits.count > 0) {
         // 1. A win banner outranks everything else — stop tapping and report it.
-        DYTextHit *winHit = [hits dy_firstHitContaining:kWordCongrats];
-        if (!winHit) {
-            winHit = [hits dy_firstHitContaining:kWordWon];
+        //    Only fire on a dedicated win-modal phrase, never on chat "恭喜".
+        DYTextHit *winHit = nil;
+        for (NSString *phrase in kWinPhrases) {
+            winHit = [hits dy_firstHitContaining:phrase];
+            if (winHit) {
+                break;
+            }
         }
         if (winHit) {
             [self handleWin:winHit];
@@ -264,6 +273,8 @@ static const NSInteger kQuietThreshold = 10;
     NSString *t = candidate.text ?: @"";
     if ([t rangeOfString:@"人参与"].location != NSNotFound) return nil;
     if ([t rangeOfString:@"人已参与"].location != NSNotFound) return nil;
+    if ([t rangeOfString:@"参与人数"].location != NSNotFound) return nil; // participant count, not a button
+    if ([t rangeOfString:@"条件"].location != NSNotFound) return nil;     // "参与条件" label, not a button
     if ([t rangeOfString:@":"].location != NSNotFound) return nil;
     if (t.length > 30) return nil;
     return candidate;
@@ -343,6 +354,14 @@ static const NSInteger kQuietThreshold = 10;
             continue;
         }
         if ([text rangeOfString:@"人已参与"].location != NSNotFound) {
+            continue;
+        }
+        // "参与人数9" is a participant-count label; "参与条件" is the conditions
+        // text. Both contain "参与" but neither is the join button.
+        if ([text rangeOfString:@"参与人数"].location != NSNotFound) {
+            continue;
+        }
+        if ([text rangeOfString:@"条件"].location != NSNotFound) {
             continue;
         }
         // Countdown-ish strings are not buttons either.
