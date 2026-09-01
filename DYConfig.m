@@ -58,6 +58,9 @@ DYBoolKey(masterEnabled, MasterEnabled, YES)
 DYBoolKey(superBagAutoJoin, SuperBagAutoJoin, YES)
 DYBoolKey(normalBagAutoJoin, NormalBagAutoJoin, YES)
 DYBoolKey(commentKeywordAutoSend, CommentKeywordAutoSend, YES)
+// Off by default: auto-following / joining a fan club is a visible social action,
+// so the user must opt in rather than have it happen silently on every gated bag.
+DYBoolKey(autoFollowForBags, AutoFollowForBags, NO)
 DYBoolKey(autoPatrol, AutoPatrol, YES)
 DYBoolKey(winBannerAlert, WinBannerAlert, YES)
 

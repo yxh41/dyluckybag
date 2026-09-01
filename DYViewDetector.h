@@ -24,6 +24,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// First hit for a single keyword (case-insensitive, whitespace-collapsed).
 + (nullable DYViewHit *)firstViewWithTextContaining:(NSString *)keyword;
 
+/// First editable text field / view in the front window (prefers the current
+/// first responder). Used to fill the comment box a 口令 福袋 opens on tap.
++ (nullable DYViewHit *)firstInputField;
+
+/// First UIControl (usually a button) whose title contains `keyword`.
+/// Differs from -firstViewWithTextContaining: by requiring a tappable control,
+/// so a "发送" label is never mistaken for a non-interactive title.
++ (nullable DYViewHit *)firstControlWithTextContaining:(NSString *)keyword;
+
+/// First UIControl whose title contains any of `keywords`.
++ (nullable DYViewHit *)firstControlWithTextContainingAny:(NSArray<NSString *> *)keywords;
+
 @end
 
 NS_ASSUME_NONNULL_END

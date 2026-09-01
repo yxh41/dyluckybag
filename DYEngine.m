@@ -49,6 +49,12 @@ static const NSInteger kQuietThreshold = 10;
 - (DYTextHit *)joinButtonHitFromHits:(NSArray<DYTextHit *> *)hits;
 - (DYViewHit *)validJoinView:(DYViewHit *)candidate;
 - (void)verifyTapAtPoint:(CGPoint)point;
+// Comment / 口令 bag participation (Option B).
+- (void)sendCommentWithKeyword:(NSString *)keyword tapPoint:(CGPoint)pt;
+- (void)attemptCommentSend:(NSString *)keyword attempt:(NSInteger)attempt;
+- (void)fillInput:(UIView *)view withText:(NSString *)text;
+- (void)handleFollowGate;
+- (void)verifyCommentSent;
 @end
 
 @implementation DYEngine
@@ -252,12 +258,23 @@ static const NSInteger kQuietThreshold = 10;
         self.lastTapPoint = center;
         self.lastTapTime = CACurrentMediaTime();
         self.state = DYEngineStateJoined;
-        [[DYConfig shared] incrementJoinCount];
-        [[DYConfig shared] synchronize];
-        [self updateStatus:@"已点击参与"];
         DYLog(@"join dispatched; today joins=%ld",
               (long)[DYConfig shared].todayJoinCount);
-        [self verifyTapAtPoint:center];
+        // A 口令/评论 福袋: tapping 参与 only opens the comment sheet. Real
+        // participation completes only when the comment is posted, so defer the
+        // join count until the send succeeds (see sendCommentWithKeyword:).
+        BOOL commentBag = (self.lastKeyword.length > 0) && [DYConfig shared].commentKeywordAutoSend;
+        NSString *kw = self.lastKeyword;
+        if (commentBag) {
+            [self sendCommentWithKeyword:kw tapPoint:center];
+        } else {
+            [[DYConfig shared] incrementJoinCount];
+            [[DYConfig shared] synchronize];
+            [self updateStatus:@"已点击参与"];
+            [self verifyTapAtPoint:center];
+        }
+        // Consumed for this bag — prevents a stale 口令 leaking onto the next bag.
+        self.lastKeyword = nil;
     } else {
         [self updateStatus:@"点击失败：未找到可响应的控件"];
     }
@@ -317,6 +334,131 @@ static const NSInteger kQuietThreshold = 10;
             }
             DYLog(@"tap verify: OK - join button gone from the tapped spot");
         }];
+    });
+}
+
+#pragma mark - Comment / 口令 bag participation (Option B)
+
+/// A 口令 福袋 only counts as joined once the comment is actually posted. The
+/// 参与 tap opened the comment sheet; this posts the captured 口令 into it.
+- (void)sendCommentWithKeyword:(NSString *)keyword tapPoint:(CGPoint)pt {
+    if (keyword.length == 0) {
+        return;
+    }
+    DYLog(@"comment bag: 口令 '%@' — opening sheet to post", keyword);
+    [self updateStatus:[NSString stringWithFormat:@"口令福袋：%@", keyword]];
+    [self attemptCommentSend:keyword attempt:0];
+}
+
+/// Probes for the comment input a few times, because the sheet animates in and
+/// the first scan after the tap may run before it is on screen.
+- (void)attemptCommentSend:(NSString *)keyword attempt:(NSInteger)attempt {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.running) {
+            return;
+        }
+
+        // Some bags gate commenting behind 关注 / 加入粉丝团. Tap it first when
+        // the user opted in; otherwise just note it (the send will likely fail,
+        // which we report honestly instead of faking a join).
+        [strongSelf handleFollowGate];
+
+        DYViewHit *input = [DYViewDetector firstInputField];
+        if (!input) {
+            if (attempt < 2) {
+                DYLog(@"comment send: input not ready (attempt %ld), retrying", (long)attempt);
+                [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
+                return;
+            }
+            DYLog(@"comment send: no input field appeared");
+            [strongSelf updateStatus:@"评论框未出现，参与未完成"];
+            return;   // not a real join — do not inflate the counter
+        }
+
+        [strongSelf fillInput:input.view withText:keyword];
+
+        DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
+        if (!send) {
+            if (attempt < 2) {
+                DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
+                [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
+                return;
+            }
+            DYLog(@"comment send: no 发送/发表/发布 button found");
+            [strongSelf updateStatus:@"发送按钮未找到，参与未完成"];
+            return;
+        }
+
+        BOOL ok = [[DYTouch shared] tapView:send.view];
+        if (ok) {
+            DYLog(@"comment sent: '%@'", keyword);
+            [[DYConfig shared] incrementJoinCount];
+            [[DYConfig shared] synchronize];
+            [strongSelf updateStatus:[NSString stringWithFormat:@"已发评论：%@", keyword]];
+            [strongSelf verifyCommentSent];
+        } else {
+            DYLog(@"comment send: tap on 发送 failed");
+            [strongSelf updateStatus:@"发送点击失败"];
+            // Tap failed — incomplete, do not count.
+        }
+    });
+}
+
+/// Writes `text` into a UITextField / UITextView and notifies the host app's
+/// change handlers so the 发送 button enables (setting .text alone is not
+/// enough — Douyin keys off the editing-changed event / delegate callback).
+- (void)fillInput:(UIView *)view withText:(NSString *)text {
+    if ([view isKindOfClass:UITextField.class]) {
+        UITextField *tf = (UITextField *)view;
+        tf.text = text;
+        if ([tf.delegate respondsToSelector:@selector(textFieldDidChange:)]) {
+            [tf.delegate textFieldDidChange:tf];
+        }
+        [tf sendActionsForControlEvents:UIControlEventEditingChanged];
+    } else if ([view isKindOfClass:UITextView.class]) {
+        UITextView *tv = (UITextView *)view;
+        tv.text = text;
+        if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)]) {
+            [tv.delegate textViewDidChange:tv];
+        }
+    }
+    DYLog(@"filled comment input with %lu chars", (unsigned long)text.length);
+}
+
+/// Taps a 关注 / 加入粉丝团 gate when present and the user opted in.
+- (void)handleFollowGate {
+    DYViewHit *gate = [DYViewDetector firstControlWithTextContainingAny:@[ @"关注", @"加入粉丝团", @"加入团" ]];
+    if (!gate) {
+        return;
+    }
+    if (![DYConfig shared].autoFollowForBags) {
+        DYLog(@"follow gate detected ('%@') but autoFollowForBags is OFF — comment may be blocked",
+              gate.text);
+        return;
+    }
+    DYLog(@"follow gate: tapping '%@'", gate.text);
+    [[DYTouch shared] tapView:gate.view];
+}
+
+/// Light post-send check: the 发送 button should be gone once the comment posts.
+- (void)verifyCommentSent {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.running) {
+            return;
+        }
+        DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
+        if (!send) {
+            DYLog(@"comment verify: OK - 发送 button gone (comment posted)");
+        } else {
+            DYLog(@"comment verify: 发送 button still present - send may not have landed");
+            [strongSelf updateStatus:@"评论可能未发出"];
+        }
     });
 }
 
@@ -397,9 +539,9 @@ static const NSInteger kQuietThreshold = 10;
         DYLog(@"captured keyword: '%@'", keyword);
         [self updateStatus:[NSString stringWithFormat:@"已捕获口令：%@", keyword]];
 
-        // v0.1: log only. Sending the comment needs a reliable way to reach the
-        // live room's input field, which is the next milestone.
-        DYLog(@"keyword send not implemented yet in v0.1");
+        // The actual post happens in -sendCommentWithKeyword: once we tap 参与
+        // and the comment sheet opens; we just remember the 口令 here.
+        DYLog(@"keyword captured, will post on join");
         return;
     }
 }

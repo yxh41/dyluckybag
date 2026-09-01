@@ -19,6 +19,7 @@ typedef NS_ENUM(NSInteger, DYPatrolMode) {
 @property (nonatomic) BOOL superBagAutoJoin;
 @property (nonatomic) BOOL normalBagAutoJoin;
 @property (nonatomic) BOOL commentKeywordAutoSend;
+@property (nonatomic) BOOL autoFollowForBags;   // tap 关注 / 加入粉丝团 gate when a comment bag requires it
 @property (nonatomic) BOOL autoPatrol;
 @property (nonatomic) BOOL winBannerAlert;
 

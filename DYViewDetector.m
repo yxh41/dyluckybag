@@ -145,4 +145,72 @@
     return all.firstObject;
 }
 
+#pragma mark - Input fields & controls
+
++ (NSArray<DYViewHit *> *)findInputFields {
+    UIWindow *window = [self frontWindow];
+    if (!window) {
+        return @[];
+    }
+    NSMutableArray<DYViewHit *> *out = [NSMutableArray array];
+    void (^walk)(UIView *, NSUInteger) = nil;
+    walk = ^(UIView *view, NSUInteger depth) {
+        if (depth > 40) {
+            return;
+        }
+        if (view.hidden || view.alpha < 0.01) {
+            return;
+        }
+        if ([view isKindOfClass:UITextField.class] || [view isKindOfClass:UITextView.class]) {
+            DYViewHit *hit = [[DYViewHit alloc] init];
+            hit.text = [self readableTextOfView:view];
+            hit.view = view;
+            hit.isControl = YES;
+            hit.screenRect = [view convertRect:view.bounds toView:nil];
+            [out addObject:hit];
+        }
+        for (UIView *sub in view.subviews) {
+            walk(sub, depth + 1);
+        }
+    };
+    @try {
+        walk(window, 0);
+    } @catch (NSException *exception) {
+        DYLog(@"viewdetect: input traversal threw: %@", exception.reason);
+    }
+    return out;
+}
+
++ (DYViewHit *)firstInputField {
+    NSArray<DYViewHit *> *all = [self findInputFields];
+    // The comment box auto-focuses when the 口令 sheet opens, so the first
+    // responder is almost always the field we want.
+    for (DYViewHit *hit in all) {
+        if ([hit.view isFirstResponder]) {
+            return hit;
+        }
+    }
+    return all.firstObject;
+}
+
++ (DYViewHit *)firstControlWithTextContaining:(NSString *)keyword {
+    NSArray<DYViewHit *> *all = [self findViewsWithTextContaining:@[ keyword ]];
+    for (DYViewHit *hit in all) {
+        if ([hit.view isKindOfClass:UIControl.class]) {
+            return hit;
+        }
+    }
+    return nil;
+}
+
++ (DYViewHit *)firstControlWithTextContainingAny:(NSArray<NSString *> *)keywords {
+    for (NSString *kw in keywords) {
+        DYViewHit *hit = [self firstControlWithTextContaining:kw];
+        if (hit) {
+            return hit;
+        }
+    }
+    return nil;
+}
+
 @end
