@@ -399,46 +399,69 @@ static const NSInteger kQuietThreshold = 10;
             comment = prefill;   // Douyin prefilled the box with the 口令
         }
         if (comment.length == 0) {
-            // No 口令 anywhere we can read. Dump the sheet so the next log shows
-            // exactly what Douyin displays (it may render the 口令 as an image),
-            // and bail honestly instead of posting an empty comment.
-            [strongSelf dumpCommentSheet];
-            [strongSelf updateStatus:@"未捕获口令，无法发评论"];
-            return;   // not a real join — do not inflate the counter
+            // View tree + prefill found nothing. Last resort: OCR the screen —
+            // Douyin sometimes renders the 口令 as an image, which the view tree
+            // cannot read but Vision can. If OCR also fails, dump and bail.
+            [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
+                NSString *ocrKw = nil;
+                for (DYTextHit *h in hits) {
+                    if ([h.text rangeOfString:kWordKeyword].location != NSNotFound) {
+                        NSString *kw = [strongSelf keywordFromText:h.text];
+                        if (kw.length) { ocrKw = kw; break; }
+                    }
+                }
+                if (ocrKw.length) {
+                    DYLog(@"captured 口令 via OCR: '%@'", ocrKw);
+                    [strongSelf fillAndSend:ocrKw input:input prefill:prefill attempt:attempt];
+                } else {
+                    [strongSelf dumpCommentSheet];
+                    [strongSelf updateStatus:@"未捕获口令，无法发评论"];
+                }
+            }];
+            return;   // wait for OCR completion before deciding
         }
 
-        // Only overwrite the box when it is empty; a prefilled 口令 must be kept.
-        if (prefill.length == 0) {
-            [strongSelf fillInput:input.view withText:comment];
-        } else {
-            DYLog(@"comment box prefilled with '%@' — sending as-is", prefill);
-        }
+        [strongSelf fillAndSend:comment input:input prefill:prefill attempt:attempt];
+    });
+}
 
-        DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
-        if (!send) {
-            if (attempt < 2) {
-                DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
-                [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
-                return;
-            }
-            DYLog(@"comment send: no 发送/发表/发布 button found");
-            [strongSelf updateStatus:@"发送按钮未找到，参与未完成"];
+/// Shared fill-and-send tail for the comment flow. Used both when the 口令 is
+/// resolved from the view tree / prefill and when it is recovered via OCR.
+- (void)fillAndSend:(NSString *)comment
+              input:(DYViewHit *)input
+           prefill:(NSString *)prefill
+           attempt:(NSInteger)attempt {
+    // Only overwrite the box when it is empty; a prefilled 口令 must be kept.
+    if (prefill.length == 0) {
+        [self fillInput:input.view withText:comment];
+    } else {
+        DYLog(@"comment box prefilled with '%@' — sending as-is", prefill);
+    }
+
+    DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
+    if (!send) {
+        if (attempt < 2) {
+            DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
+            [self attemptCommentSend:comment attempt:attempt + 1];
             return;
         }
+        DYLog(@"comment send: no 发送/发表/发布 button found");
+        [self updateStatus:@"发送按钮未找到，参与未完成"];
+        return;
+    }
 
-        BOOL ok = [[DYTouch shared] tapView:send.view];
-        if (ok) {
-            DYLog(@"comment sent: '%@'", comment);
-            [[DYConfig shared] incrementJoinCount];
-            [[DYConfig shared] synchronize];
-            [strongSelf updateStatus:[NSString stringWithFormat:@"已发评论：%@", comment]];
-            [strongSelf verifyCommentSent];
-        } else {
-            DYLog(@"comment send: tap on 发送 failed");
-            [strongSelf updateStatus:@"发送点击失败"];
-            // Tap failed — incomplete, do not count.
-        }
-    });
+    BOOL ok = [[DYTouch shared] tapView:send.view];
+    if (ok) {
+        DYLog(@"comment sent: '%@'", comment);
+        [[DYConfig shared] incrementJoinCount];
+        [[DYConfig shared] synchronize];
+        [self updateStatus:[NSString stringWithFormat:@"已发评论：%@", comment]];
+        [self verifyCommentSent];
+    } else {
+        DYLog(@"comment send: tap on 发送 failed");
+        [self updateStatus:@"发送点击失败"];
+        // Tap failed — incomplete, do not count.
+    }
 }
 
 /// Re-scans the live view tree for the 口令, in case it is only revealed after
