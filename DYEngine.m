@@ -426,9 +426,10 @@ static const NSInteger kQuietThreshold = 10;
             #pragma clang diagnostic pop
         }
     } else if ([view isKindOfClass:UITextView.class]) {
+        // UITextView is NOT a UIControl, so it has no sendActionsForControlEvents:.
+        // Notify via the delegate callback (and the change notification) instead.
         UITextView *tv = (UITextView *)view;
         tv.text = text;
-        [tv sendActionsForControlEvents:UIControlEventEditingChanged];
         id delegate = tv.delegate;
         if ([delegate respondsToSelector:@selector(textViewDidChange:)]) {
             #pragma clang diagnostic push
@@ -436,6 +437,8 @@ static const NSInteger kQuietThreshold = 10;
             [delegate performSelector:@selector(textViewDidChange:) withObject:tv];
             #pragma clang diagnostic pop
         }
+        [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification
+                                                            object:tv];
     }
     DYLog(@"filled comment input with %lu chars", (unsigned long)text.length);
 }
