@@ -260,13 +260,14 @@ static const NSInteger kQuietThreshold = 10;
         self.state = DYEngineStateJoined;
         DYLog(@"join dispatched; today joins=%ld",
               (long)[DYConfig shared].todayJoinCount);
-        // A 口令/评论 福袋: tapping 参与 only opens the comment sheet. Real
-        // participation completes only when the comment is posted, so defer the
-        // join count until the send succeeds (see sendCommentWithKeyword:).
-        BOOL commentBag = (self.lastKeyword.length > 0) && [DYConfig shared].commentKeywordAutoSend;
-        NSString *kw = self.lastKeyword;
-        if (commentBag) {
-            [self sendCommentWithKeyword:kw tapPoint:center];
+        // When comment auto-send is on, route every join through the comment
+        // flow: tap 参与, open the sheet, capture the 口令 from inside it
+        // (Douyin reveals the 口令 only after 参与 opens the sheet — it is never
+        // on the bag card at detection time), then post. For bags that join
+        // straight on 参与 with no comment box, the flow detects "no input
+        // field" and falls back to a plain join, so normal bags are unaffected.
+        if ([DYConfig shared].commentKeywordAutoSend) {
+            [self sendCommentWithKeyword:self.lastKeyword tapPoint:center];
         } else {
             [[DYConfig shared] incrementJoinCount];
             [[DYConfig shared] synchronize];
@@ -342,11 +343,10 @@ static const NSInteger kQuietThreshold = 10;
 /// A 口令 福袋 only counts as joined once the comment is actually posted. The
 /// 参与 tap opened the comment sheet; this posts the captured 口令 into it.
 - (void)sendCommentWithKeyword:(NSString *)keyword tapPoint:(CGPoint)pt {
-    if (keyword.length == 0) {
-        return;
-    }
-    DYLog(@"comment bag: 口令 '%@' — opening sheet to post", keyword);
-    [self updateStatus:[NSString stringWithFormat:@"口令福袋：%@", keyword]];
+    // keyword may be empty here: the 口令 is usually revealed only after 参与
+    // opens the comment sheet, so -attemptCommentSend: re-scans the sheet (and
+    // checks for a Douyin-prefilled box) before deciding what to post.
+    DYLog(@"comment flow: 参与 tapped, resolving 口令 from sheet (pre-tap='%@')", keyword);
     [self attemptCommentSend:keyword attempt:0];
 }
 
@@ -366,19 +366,53 @@ static const NSInteger kQuietThreshold = 10;
         // which we report honestly instead of faking a join).
         [strongSelf handleFollowGate];
 
+        // Resolve the 口令 to post. The card never shows it at detection time;
+        // Douyin reveals it only inside the comment sheet after 参与 opens it,
+        // and sometimes even prefills the box with it. Priority:
+        //   1. captured pre-tap (keyword arg / self.lastKeyword)
+        //   2. re-scanned from the now-open sheet
+        //   3. already typed into the box by Douyin (prefill) — send as-is
+        NSString *comment = (keyword.length > 0) ? keyword : [strongSelf captureKeywordFromSheet];
+        NSString *prefill = nil;
+
         DYViewHit *input = [DYViewDetector firstInputField];
         if (!input) {
+            // No comment box appeared. Two cases:
+            //  - a plain bag that joins straight on 参与 (no sheet) -> count it;
+            //  - a 口令 bag whose sheet is still animating in -> retry.
             if (attempt < 2) {
                 DYLog(@"comment send: input not ready (attempt %ld), retrying", (long)attempt);
                 [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
                 return;
             }
-            DYLog(@"comment send: no input field appeared");
-            [strongSelf updateStatus:@"评论框未出现，参与未完成"];
+            // Genuinely no comment box: treat as a plain join (参与 already joined).
+            DYLog(@"comment flow: no comment box — plain bag, counting join");
+            [[DYConfig shared] incrementJoinCount];
+            [[DYConfig shared] synchronize];
+            [strongSelf updateStatus:@"已参与（无评论框）"];
+            [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
+            return;   // real join — count it
+        }
+
+        prefill = [strongSelf textOfInput:input.view];
+        if (comment.length == 0) {
+            comment = prefill;   // Douyin prefilled the box with the 口令
+        }
+        if (comment.length == 0) {
+            // No 口令 anywhere we can read. Dump the sheet so the next log shows
+            // exactly what Douyin displays (it may render the 口令 as an image),
+            // and bail honestly instead of posting an empty comment.
+            [strongSelf dumpCommentSheet];
+            [strongSelf updateStatus:@"未捕获口令，无法发评论"];
             return;   // not a real join — do not inflate the counter
         }
 
-        [strongSelf fillInput:input.view withText:keyword];
+        // Only overwrite the box when it is empty; a prefilled 口令 must be kept.
+        if (prefill.length == 0) {
+            [strongSelf fillInput:input.view withText:comment];
+        } else {
+            DYLog(@"comment box prefilled with '%@' — sending as-is", prefill);
+        }
 
         DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
         if (!send) {
@@ -394,10 +428,10 @@ static const NSInteger kQuietThreshold = 10;
 
         BOOL ok = [[DYTouch shared] tapView:send.view];
         if (ok) {
-            DYLog(@"comment sent: '%@'", keyword);
+            DYLog(@"comment sent: '%@'", comment);
             [[DYConfig shared] incrementJoinCount];
             [[DYConfig shared] synchronize];
-            [strongSelf updateStatus:[NSString stringWithFormat:@"已发评论：%@", keyword]];
+            [strongSelf updateStatus:[NSString stringWithFormat:@"已发评论：%@", comment]];
             [strongSelf verifyCommentSent];
         } else {
             DYLog(@"comment send: tap on 发送 failed");
@@ -405,6 +439,45 @@ static const NSInteger kQuietThreshold = 10;
             // Tap failed — incomplete, do not count.
         }
     });
+}
+
+/// Re-scans the live view tree for the 口令, in case it is only revealed after
+/// 参与 opens the comment sheet. Returns the extracted keyword, or nil.
+- (NSString *)captureKeywordFromSheet {
+    NSArray<DYViewHit *> *hits = [DYViewDetector findViewsWithTextContaining:@[ kWordKeyword ]];
+    for (DYViewHit *hit in hits) {
+        NSString *kw = [self keywordFromText:hit.text];
+        if (kw.length > 0) {
+            DYLog(@"captured 口令 from sheet: '%@'", kw);
+            return kw;
+        }
+    }
+    return nil;
+}
+
+/// Current editable text of an input field (to detect a Douyin-prefilled 口令).
+- (NSString *)textOfInput:(UIView *)view {
+    if ([view isKindOfClass:UITextField.class]) {
+        return ((UITextField *)view).text ?: @"";
+    }
+    if ([view isKindOfClass:UITextView.class]) {
+        return ((UITextView *)view).text ?: @"";
+    }
+    return @"";
+}
+
+/// Diagnostic: dump any comment-related text visible in the front window so the
+/// next log reveals what Douyin actually shows (e.g. 口令 rendered as an image).
+- (void)dumpCommentSheet {
+    NSArray<DYViewHit *> *hits =
+        [DYViewDetector findViewsWithTextContaining:@[ kWordKeyword, @"说点", @"评论", @"发送", @"发表", @"口令" ]];
+    if (hits.count == 0) {
+        DYLog(@"comment sheet dump: no comment-related text visible");
+        return;
+    }
+    for (DYViewHit *hit in hits) {
+        DYLog(@"comment sheet text: '%@' (%@)", hit.text, NSStringFromClass(hit.view.class));
+    }
 }
 
 /// Writes `text` into a UITextField / UITextView and notifies the host app's

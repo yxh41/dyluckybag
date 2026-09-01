@@ -73,6 +73,8 @@
     } else if ([view isKindOfClass:UITextField.class]) {
         NSString *t = ((UITextField *)view).text;
         if (t.length) [parts addObject:t];
+        NSString *ph = ((UITextField *)view).placeholder;
+        if (ph.length) [parts addObject:ph];
     } else if ([view isKindOfClass:UITextView.class]) {
         NSString *t = ((UITextView *)view).text;
         if (t.length) [parts addObject:t];
