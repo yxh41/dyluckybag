@@ -25,6 +25,12 @@
 /// Nearest UIControl at or above the view that occupies `point`, if any.
 - (UIControl *)controlAtPoint:(CGPoint)point;
 
+/// Taps `view` directly by walking up to the nearest UIControl with live
+/// target-action pairs (or a tap gesture) and firing it — no screenshot needed.
+/// Falls back to tapping the view's centre point if no live control is found.
+/// Returns YES when a tap was actually dispatched.
+- (BOOL)tapView:(UIView *)view;
+
 @end
 
 #endif /* DYLUCKYBAG_DYTOUCH_H */
