@@ -914,12 +914,12 @@ static const CGFloat kRowH        = 44.0;
     UIView *host = self.window.rootViewController.view;
     CGFloat width = UIScreen.mainScreen.bounds.size.width - 32.0;
 
-    UILabel *banner = [[UILabel alloc] initWithFrame:CGRectMake(16.0, -80.0, width, 56.0)];
-    banner.text = [NSString stringWithFormat:@"🎉 %@", text];
-    banner.textColor = [UIColor whiteColor];
-    banner.font = [UIFont boldSystemFontOfSize:15.0];
-    banner.textAlignment = NSTextAlignmentCenter;
-    banner.numberOfLines = 0;
+    // The banner is a plain container that hosts the gradient; the text lives in
+    // a child UILabel. A UILabel rasterizes its glyphs into its own layer.contents,
+    // and Core Animation always paints sublayers ON TOP of a layer's contents — so
+    // putting the gradient directly on the label's layer (insertSublayer:atIndex:0)
+    // would paint red over the white text. Splitting them keeps the text readable.
+    UIView *banner = [[UIView alloc] initWithFrame:CGRectMake(16.0, -80.0, width, 56.0)];
     banner.layer.cornerRadius = 14.0;
     banner.clipsToBounds = YES;
     banner.alpha = 0.0;
@@ -929,7 +929,16 @@ static const CGFloat kRowH        = 44.0;
     g.cornerRadius = 14.0;
     g.colors = @[ (__bridge id)[UIColor colorWithRed:0.98 green:0.30 blue:0.42 alpha:1.0].CGColor,
                    (__bridge id)[UIColor colorWithRed:0.86 green:0.13 blue:0.18 alpha:1.0].CGColor ];
-    [banner.layer insertSublayer:g atIndex:0];
+    [banner.layer addSublayer:g];
+
+    UILabel *textLabel = [[UILabel alloc] initWithFrame:banner.bounds];
+    textLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    textLabel.text = [NSString stringWithFormat:@"🎉 %@", text];
+    textLabel.textColor = [UIColor whiteColor];
+    textLabel.font = [UIFont boldSystemFontOfSize:15.0];
+    textLabel.textAlignment = NSTextAlignmentCenter;
+    textLabel.numberOfLines = 0;
+    [banner addSubview:textLabel];
 
     [host addSubview:banner];
 
