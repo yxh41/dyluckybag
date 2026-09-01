@@ -51,8 +51,12 @@ jobs:
             bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
             BUILD_SCHEME=roothide
             BUILD_ARCHS=arm64e
-            # roothide packages require libroothide at runtime.
-            sed -i.bak -E 's|^Depends:.*|Depends: libroothide, firmware (>= 15.0)|' control
+            # roothide devices always ship libroothide in the bootstrap, but it is
+            # NOT always registered as a dpkg package in the user's package
+            # manager. A hard Depends therefore makes the .deb uninstallable
+            # ("dependency not satisfiable"). Drop it: the dylib still links
+            # libroothide at build time and loads it at runtime on roothide.
+            sed -i.bak -E 's|^Depends:.*|Depends: firmware (>= 15.0)|' control
           else
             echo "== cloning standard theos + sdks =="
             git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
