@@ -729,6 +729,11 @@ static const CGFloat kRowH        = 44.0;
                                toView:content
                               getter:@selector(commentKeywordAutoSend)
                               setter:@selector(setCommentKeywordAutoSend:)];
+    cursor = [self addToggleWithTitle:@"口令袋·需关注时自动关注"
+                                    y:cursor
+                               toView:content
+                              getter:@selector(autoFollowForBags)
+                              setter:@selector(setAutoFollowForBags:)];
     cursor = [self addToggleWithTitle:@"直播间自动巡逻"
                                     y:cursor
                                toView:content
