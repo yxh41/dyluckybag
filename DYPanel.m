@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 #import <QuartzCore/QuartzCore.h>
 
-static const CGFloat kFloatSize   = 60.0;
+static const CGFloat kFloatSize   = 44.0;
 static const CGFloat kPanelMargin = 14.0;
 static const CGFloat kGrabberH    = 22.0;   // drag handle strip
 static const CGFloat kHeaderH     = 46.0;   // title + 收起 / 隐藏
@@ -414,7 +414,7 @@ static const CGFloat kRowH        = 44.0;
     button.layer.shadowOffset = CGSizeMake(0.0, 4.0);
 
     [button setTitle:@"福" forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont boldSystemFontOfSize:30.0];
+    button.titleLabel.font = [UIFont boldSystemFontOfSize:kFloatSize * 0.5];
     [button setTitleColor:DY_GOLD forState:UIControlStateNormal];
 
     // Gentle attention pulse on the shadow.
