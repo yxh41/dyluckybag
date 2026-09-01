@@ -38,6 +38,10 @@ static const NSInteger kQuietThreshold = 10;
 @property (nonatomic) NSString *lastKeyword;
 @property (nonatomic) NSInteger quietPasses;
 @property (nonatomic) NSTimeInterval currentInterval;
+
+// Declared up front so -Werror never trips on a forward reference.
+- (DYTextHit *)joinButtonHitFromHits:(NSArray<DYTextHit *> *)hits;
+- (void)verifyTapAtPoint:(CGPoint)point;
 @end
 
 @implementation DYEngine
@@ -221,9 +225,50 @@ static const NSInteger kQuietThreshold = 10;
         [self updateStatus:@"已点击参与"];
         DYLog(@"join dispatched; today joins=%ld",
               (long)[DYConfig shared].todayJoinCount);
+        [self verifyTapAtPoint:center];
     } else {
         [self updateStatus:@"点击失败：未找到可响应的控件"];
     }
+}
+
+/// From inside the tweak a tap Douyin ignored looks exactly like one it honoured
+/// — all three delivery mechanisms return success regardless. So go back and
+/// look: if the join button is still sitting where we tapped it, the tap did not
+/// land, and the log should say so instead of reporting another phantom join.
+- (void)verifyTapAtPoint:(CGPoint)point {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.running) {
+            return;
+        }
+
+        [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
+            if (error || hits.count == 0) {
+                DYLog(@"tap verify: inconclusive (no OCR result)");
+                return;
+            }
+            if ([hits dy_firstHitContaining:@"已参与"]) {
+                DYLog(@"tap verify: OK - screen now shows 已参与");
+                return;
+            }
+
+            DYTextHit *still = [strongSelf joinButtonHitFromHits:hits];
+            if (still) {
+                CGPoint current = CGPointMake(CGRectGetMidX(still.rect), CGRectGetMidY(still.rect));
+                CGFloat distance = hypot(current.x - point.x, current.y - point.y);
+                if (distance < kTapProximity) {
+                    DYLog(@"tap verify: FAILED - join button still on screen %.0fpt from "
+                          @"the tap. Douyin did not respond to any delivery mechanism.",
+                          distance);
+                    [strongSelf updateStatus:@"点击未生效：抖音无响应"];
+                    return;
+                }
+            }
+            DYLog(@"tap verify: OK - join button gone from the tapped spot");
+        }];
+    });
 }
 
 - (void)handleWin:(DYTextHit *)hit {

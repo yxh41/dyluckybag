@@ -22,6 +22,12 @@
 - (UIEvent *)_touchesEvent;
 @end
 
+@interface DYTouch ()
+- (UIWindow *)frontWindow;
+- (BOOL)fireTapGestureAtPoint:(CGPoint)point;
+- (BOOL)synthesizeTouchAtPoint:(CGPoint)point;
+@end
+
 @implementation DYTouch
 
 + (instancetype)shared {
@@ -43,24 +49,35 @@
 }
 
 - (BOOL)tapAtPoint:(CGPoint)point {
-    // First try: legitimate UIKit control activation.
+    // Three strategies, cheapest and most faithful first. Douyin mixes plain
+    // buttons with self-drawn views driven by gesture recognisers, and no single
+    // delivery mechanism covers both, so fall through until one lands.
+
+    // 1. A real UIControl with registered targets: just ask UIKit to fire it.
     UIControl *control = [self controlAtPoint:point];
     if (control) {
         NSSet *targets = control.allTargets;
         // A UIControl with zero registered targets will not do anything when
-        // asked to send actions, so fall through to the synthesised touch.
+        // asked to send actions, so fall through to the next strategy.
         if (control.enabled && control.userInteractionEnabled && targets.count > 0) {
             DYLog(@"tap: firing actions on %@ (%lu targets)",
                   NSStringFromClass(control.class), (unsigned long)targets.count);
             [control sendActionsForControlEvents:UIControlEventTouchUpInside];
             return YES;
         }
-        DYLog(@"tap: found %@ but it has %lu targets; using synthesised touch",
+        DYLog(@"tap: found %@ but it has %lu targets; trying gestures",
               NSStringFromClass(control.class), (unsigned long)targets.count);
     }
 
-    // Second try: synthesise a real touch so gesture recognisers and
-    // touchesBegan:withEvent: handlers see it.
+    // 2. The join button is very often a plain view with a tap gesture on one of
+    // its containers. Invoke the recogniser's own targets directly — far more
+    // reliable than a synthesised touch, which modern gesture recognisers tend
+    // to ignore outright.
+    if ([self fireTapGestureAtPoint:point]) {
+        return YES;
+    }
+
+    // 3. Last resort: push a real touch through the responder chain.
     return [self synthesizeTouchAtPoint:point];
 }
 
@@ -86,20 +103,83 @@
         candidate = candidate.superview;
     }
 
-    // Some Douyin buttons are plain views with a tap gesture attached. Walk a
-    // few levels up looking for one, since the gesture is usually on the
-    // container rather than the innermost label view.
-    candidate = hitView;
-    for (NSUInteger level = 0; level < 5 && candidate; level++) {
-        for (UIGestureRecognizer *recognizer in candidate.gestureRecognizers) {
-            if ([recognizer isKindOfClass:UITapGestureRecognizer.class]) {
-                return nil;  // gestures are handled by the synthesised touch path
+    return nil;
+}
+
+/// Directly invokes the targets of a UITapGestureRecognizer found on the hit
+/// view or one of its ancestors. Douyin's live-room controls are usually plain
+/// views with a tap gesture on a container, which no amount of synthesised
+/// UITouch will wake up on iOS 13+.
+- (BOOL)fireTapGestureAtPoint:(CGPoint)point {
+    UIWindow *window = [self frontWindow];
+    if (!window) {
+        return NO;
+    }
+
+    CGPoint windowPoint = [window convertPoint:point fromWindow:nil];
+    UIView *hitView = [window hitTest:windowPoint withEvent:nil];
+    if (!hitView) {
+        return NO;
+    }
+
+    UIView *candidate = hitView;
+    for (NSUInteger level = 0; level < 8 && candidate; level++) {
+        // Copy: Douyin can mutate its recogniser list while we walk it.
+        for (UIGestureRecognizer *recognizer in [candidate.gestureRecognizers copy]) {
+            if (![recognizer isKindOfClass:UITapGestureRecognizer.class] ||
+                !recognizer.enabled || !recognizer.view) {
+                continue;
+            }
+
+            @try {
+                // UIGestureRecognizer keeps its targets in a private array of
+                // UIGestureRecognizerTarget wrappers (_target / _action). KVC
+                // resolves "targets" to _targets. Everything below is guarded
+                // and falls back to the synthesised touch if it does not hold.
+                NSArray *wrappers = [recognizer valueForKey:@"targets"];
+                if (![wrappers isKindOfClass:NSArray.class] || wrappers.count == 0) {
+                    continue;
+                }
+
+                BOOL fired = NO;
+                for (id wrapper in wrappers) {
+                    id target = [wrapper valueForKey:@"target"];
+                    id actionValue = [wrapper valueForKey:@"action"];
+                    if (!target || !actionValue) {
+                        continue;
+                    }
+
+                    SEL action = NULL;
+                    if ([actionValue isKindOfClass:NSValue.class]) {
+                        action = (SEL)[(NSValue *)actionValue pointerValue];
+                    } else if ([actionValue isKindOfClass:NSString.class]) {
+                        action = NSSelectorFromString((NSString *)actionValue);
+                    }
+                    if (!action || ![target respondsToSelector:action]) {
+                        continue;
+                    }
+
+                    DYLog(@"tap: firing %@ gesture action on %@",
+                          NSStringFromClass(recognizer.class),
+                          NSStringFromClass([target class]));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    [target performSelector:action withObject:recognizer];
+#pragma clang diagnostic pop
+                    fired = YES;
+                }
+
+                if (fired) {
+                    return YES;
+                }
+            } @catch (NSException *exception) {
+                DYLog(@"tap: gesture invocation failed: %@", exception.reason);
             }
         }
         candidate = candidate.superview;
     }
 
-    return nil;
+    return NO;
 }
 
 #pragma mark - Synthesised touch
@@ -190,7 +270,15 @@
 - (UIWindow *)frontWindow {
     UIApplication *app = UIApplication.sharedApplication;
 
+    // Skip our own overlay. It floats above Douyin at alert level, so hit-testing
+    // against it would resolve to the 福 button / panel and the tap would go
+    // nowhere near Douyin's join button.
+    BOOL (^isOverlay)(UIWindow *) = ^BOOL(UIWindow *window) {
+        return window.windowLevel >= UIWindowLevelAlert;
+    };
+
     if (@available(iOS 13.0, *)) {
+        UIWindow *fallback = nil;
         for (UIScene *scene in app.connectedScenes) {
             if (scene.activationState != UISceneActivationStateForegroundActive) {
                 continue;
@@ -199,17 +287,33 @@
                 continue;
             }
             for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (window.isKeyWindow && window.bounds.size.width > 0) {
+                if (window.hidden || window.bounds.size.width <= 0) {
+                    continue;
+                }
+                if (isOverlay(window)) {
+                    continue;
+                }
+                if (window.isKeyWindow) {
                     return window;
                 }
+                if (!fallback) {
+                    fallback = window;
+                }
             }
+        }
+        if (fallback) {
+            return fallback;
         }
     }
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return app.keyWindow;
+    UIWindow *legacy = app.keyWindow;
 #pragma clang diagnostic pop
+    if (legacy && !legacy.hidden && !isOverlay(legacy)) {
+        return legacy;
+    }
+    return nil;
 }
 
 @end
