@@ -26,6 +26,7 @@ DYLuckyBag_FILES = \
 	DYLuckyBag.xm \
 	DYConfig.m \
 	DYOCRDetector.m \
+	DYViewDetector.m \
 	DYTouch.m \
 	DYEngine.m \
 	DYPanel.m \

@@ -1,6 +1,7 @@
 #import "DYEngine.h"
 #import "DYConfig.h"
 #import "DYOCRDetector.h"
+#import "DYViewDetector.h"
 #import "DYTouch.h"
 #import "DYLog.h"
 #import <QuartzCore/QuartzCore.h>
@@ -41,6 +42,7 @@ static const NSInteger kQuietThreshold = 10;
 
 // Declared up front so -Werror never trips on a forward reference.
 - (DYTextHit *)joinButtonHitFromHits:(NSArray<DYTextHit *> *)hits;
+- (DYViewHit *)validJoinView:(DYViewHit *)candidate;
 - (void)verifyTapAtPoint:(CGPoint)point;
 @end
 
@@ -140,35 +142,36 @@ static const NSInteger kQuietThreshold = 10;
 #pragma mark - Decision making
 
 - (void)handleHits:(NSArray<DYTextHit *> *)hits {
-    // Adaptive scan rate: when no lucky bag has been on screen for a while the
-    // user is almost certainly not in a live room we care about, so slow the
-    // OCR cadence right down. The instant a bag reappears we snap back to fast.
-    BOOL sawBag = NO;
-    if (hits.count > 0) {
-        if ([hits dy_firstHitContaining:kWordBag]) {
-            sawBag = YES;
-        }
-    }
+    // Decide whether a lucky bag is on screen. OCR covers the case where the
+    // screen capture succeeded; the view-tree scan needs no capture at all, so
+    // it still finds the 福袋 / 参与 controls when drawViewHierarchyInRect
+    // fails inside a live room (the Metal video layer has no CPU backing).
+    DYTextHit *bagHit = [hits dy_firstHitContaining:kWordBag];
+    BOOL bagByOCR = (bagHit != nil);
+
+    DYViewHit *bagView    = [DYViewDetector firstViewWithTextContaining:kWordBag];
+    DYViewHit *joinedView = [DYViewDetector firstViewWithTextContaining:@"已参与"];
+    DYViewHit *rawJoin = joinedView ? nil : [DYViewDetector firstViewWithTextContaining:kWordJoin];
+    DYViewHit *joinView = [self validJoinView:rawJoin];
+
+    BOOL sawBag = bagByOCR || (bagView != nil);
     self.quietPasses = sawBag ? 0 : (self.quietPasses + 1);
     [self adaptScanRate];
 
-    if (hits.count == 0) {
-        return;
+    if (hits.count > 0) {
+        // 1. A win banner outranks everything else — stop tapping and report it.
+        DYTextHit *winHit = [hits dy_firstHitContaining:kWordCongrats];
+        if (!winHit) {
+            winHit = [hits dy_firstHitContaining:kWordWon];
+        }
+        if (winHit) {
+            [self handleWin:winHit];
+            return;
+        }
     }
 
-    // 1. A win banner outranks everything else — stop tapping and report it.
-    DYTextHit *winHit = [hits dy_firstHitContaining:kWordCongrats];
-    if (!winHit) {
-        winHit = [hits dy_firstHitContaining:kWordWon];
-    }
-    if (winHit) {
-        [self handleWin:winHit];
-        return;
-    }
-
-    // 2. Is there a lucky bag on screen at all?
-    DYTextHit *bagHit = [hits dy_firstHitContaining:kWordBag];
-    if (!bagHit) {
+    // 2. No bag anywhere (neither OCR nor view tree)?
+    if (!bagByOCR && !bagView) {
         if (self.state != DYEngineStateIdle) {
             self.state = DYEngineStateIdle;
             [self updateStatus:@"当前直播间没有福袋"];
@@ -176,45 +179,65 @@ static const NSInteger kQuietThreshold = 10;
         return;
     }
 
-    DYLog(@"bag detected: '%@' at %@", bagHit.text, NSStringFromCGRect(bagHit.rect));
+    DYLog(@"bag detected (ocr=%d viewTree=%d)%@",
+          bagByOCR, bagView != nil,
+          joinView ? [NSString stringWithFormat:@" join='%@'", joinView.text] : @"");
 
     // 3. Extract the keyword (口令) if the bag requires a comment to enter.
     [self captureKeywordFromHits:hits];
 
     // 4. Already joined? Then we are waiting for the draw, not tapping again.
-    if ([hits dy_firstHitContaining:@"已参与"]) {
+    if ((bagByOCR && [hits dy_firstHitContaining:@"已参与"]) || joinedView) {
         self.state = DYEngineStateWaitingResult;
         [self updateStatus:@"已参与，等待开奖"];
         return;
     }
 
-    // 5. Find the join button.
-    DYTextHit *joinHit = [self joinButtonHitFromHits:hits];
-    if (!joinHit) {
-        self.state = DYEngineStateBagDetected;
-        [self updateStatus:@"检测到福袋，未找到参与按钮"];
-        return;
+    // 5. Locate the join button. Prefer the real UIView from the view tree so
+    //    we can fire its handler directly; fall back to the OCR rect.
+    UIView *joinTargetView = nil;
+    CGPoint center;
+    NSString *joinLabel;
+    if (joinView) {
+        joinLabel = joinView.text;
+        center = CGPointMake(CGRectGetMidX(joinView.screenRect),
+                              CGRectGetMidY(joinView.screenRect));
+        joinTargetView = joinView.view;
+    } else {
+        DYTextHit *joinOCR = [self joinButtonHitFromHits:hits];
+        if (!joinOCR) {
+            self.state = DYEngineStateBagDetected;
+            [self updateStatus:@"检测到福袋，未找到参与按钮"];
+            return;
+        }
+        joinLabel = joinOCR.text;
+        center = CGPointMake(CGRectGetMidX(joinOCR.rect), CGRectGetMidY(joinOCR.rect));
     }
 
     self.state = DYEngineStateBagDetected;
 
     // 6. Detect-only mode deliberately stops here — it is the safe way to
-    // verify OCR is seeing the right thing before letting the tweak tap.
+    //    verify detection before letting the tweak tap.
     if ([DYConfig shared].patrolMode == DYPatrolModeDetectOnly) {
-        [self updateStatus:[NSString stringWithFormat:@"[仅检测] 发现参与按钮 '%@'", joinHit.text]];
+        [self updateStatus:[NSString stringWithFormat:@"[仅检测] 发现参与按钮 '%@'", joinLabel]];
         return;
     }
 
     // 7. Debounce: do not re-tap the same button inside the cooldown window.
-    CGPoint center = CGPointMake(CGRectGetMidX(joinHit.rect), CGRectGetMidY(joinHit.rect));
     if ([self isDuplicateTapAtPoint:center]) {
         DYLog(@"tap skipped: same button as last time (cooldown %.0fs)", kTapCooldown);
         return;
     }
 
-    // 8. Tap it.
-    DYLog(@"tapping join button '%@' at %@", joinHit.text, NSStringFromCGPoint(center));
-    BOOL dispatched = [[DYTouch shared] tapInRect:joinHit.rect];
+    // 8. Tap it — through the real view when we have one, else by coordinate.
+    BOOL dispatched;
+    if (joinTargetView) {
+        DYLog(@"tapping join (view-tree) '%@' at %@", joinLabel, NSStringFromCGPoint(center));
+        dispatched = [[DYTouch shared] tapView:joinTargetView];
+    } else {
+        DYLog(@"tapping join (ocr-rect) '%@' at %@", joinLabel, NSStringFromCGPoint(center));
+        dispatched = [[DYTouch shared] tapInRect:CGRectMake(center.x - 1.0, center.y - 1.0, 2.0, 2.0)];
+    }
 
     if (dispatched) {
         self.lastTapPoint = center;
@@ -229,6 +252,21 @@ static const NSInteger kQuietThreshold = 10;
     } else {
         [self updateStatus:@"点击失败：未找到可响应的控件"];
     }
+}
+
+/// Filters the view-tree 参与 hit the same way joinButtonHitFromHits filters
+/// OCR hits: counters ("1234人参与"), countdowns (":") and over-long labels are
+/// not buttons.
+- (DYViewHit *)validJoinView:(DYViewHit *)candidate {
+    if (!candidate) {
+        return nil;
+    }
+    NSString *t = candidate.text ?: @"";
+    if ([t rangeOfString:@"人参与"].location != NSNotFound) return nil;
+    if ([t rangeOfString:@"人已参与"].location != NSNotFound) return nil;
+    if ([t rangeOfString:@":"].location != NSNotFound) return nil;
+    if (t.length > 30) return nil;
+    return candidate;
 }
 
 /// From inside the tweak a tap Douyin ignored looks exactly like one it honoured

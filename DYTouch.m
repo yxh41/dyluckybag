@@ -24,7 +24,9 @@
 
 @interface DYTouch ()
 - (UIWindow *)frontWindow;
+- (BOOL)fireTapGesture:(UITapGestureRecognizer *)recognizer;
 - (BOOL)fireTapGestureAtPoint:(CGPoint)point;
+- (BOOL)tapView:(UIView *)view;
 - (BOOL)synthesizeTouchAtPoint:(CGPoint)point;
 @end
 
@@ -106,10 +108,98 @@
     return nil;
 }
 
-/// Directly invokes the targets of a UITapGestureRecognizer found on the hit
-/// view or one of its ancestors. Douyin's live-room controls are usually plain
-/// views with a tap gesture on a container, which no amount of synthesised
-/// UITouch will wake up on iOS 13+.
+/// Directly invokes the targets of a single UITapGestureRecognizer. Douyin's
+/// live-room controls are usually plain views with a tap gesture on a container,
+/// which no amount of synthesised UITouch will wake up on iOS 13+.
+- (BOOL)fireTapGesture:(UITapGestureRecognizer *)recognizer {
+    if (![recognizer isKindOfClass:UITapGestureRecognizer.class] ||
+        !recognizer.enabled || !recognizer.view) {
+        return NO;
+    }
+
+    @try {
+        // UIGestureRecognizer keeps its targets in a private array of
+        // UIGestureRecognizerTarget wrappers (_target / _action). KVC resolves
+        // "targets" to _targets. Everything below is guarded and returns NO if
+        // it does not hold, so the caller can fall back to another strategy.
+        NSArray *wrappers = [recognizer valueForKey:@"targets"];
+        if (![wrappers isKindOfClass:NSArray.class] || wrappers.count == 0) {
+            return NO;
+        }
+
+        BOOL fired = NO;
+        for (id wrapper in wrappers) {
+            id target = [wrapper valueForKey:@"target"];
+            id actionValue = [wrapper valueForKey:@"action"];
+            if (!target || !actionValue) {
+                continue;
+            }
+
+            SEL action = NULL;
+            if ([actionValue isKindOfClass:NSValue.class]) {
+                action = (SEL)[(NSValue *)actionValue pointerValue];
+            } else if ([actionValue isKindOfClass:NSString.class]) {
+                action = NSSelectorFromString((NSString *)actionValue);
+            }
+            if (!action || ![target respondsToSelector:action]) {
+                continue;
+            }
+
+            DYLog(@"tap: firing %@ gesture action on %@",
+                  NSStringFromClass(recognizer.class),
+                  NSStringFromClass([target class]));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [target performSelector:action withObject:recognizer];
+#pragma clang diagnostic pop
+            fired = YES;
+        }
+        return fired;
+    } @catch (NSException *exception) {
+        DYLog(@"tap: gesture invocation failed: %@", exception.reason);
+        return NO;
+    }
+}
+
+/// Locates the tappable control behind `view` (a UIControl with targets, or the
+/// nearest ancestor carrying a tap gesture) and fires it directly. This is the
+/// most faithful tap we have — it calls the handler Douyin actually registered,
+/// with no coordinate guessing. Falls back to the point-based path if nothing
+/// tappable is found.
+- (BOOL)tapView:(UIView *)view {
+    if (!view) {
+        return NO;
+    }
+
+    UIView *candidate = view;
+    while (candidate) {
+        if ([candidate isKindOfClass:UIControl.class]) {
+            UIControl *c = (UIControl *)candidate;
+            if (c.enabled && c.userInteractionEnabled && c.allTargets.count > 0) {
+                DYLog(@"tapView: firing actions on %@ (%lu targets)",
+                      NSStringFromClass(c.class), (unsigned long)c.allTargets.count);
+                [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+                return YES;
+            }
+        }
+        for (UIGestureRecognizer *rec in [candidate.gestureRecognizers copy]) {
+            if ([rec isKindOfClass:UITapGestureRecognizer.class] && [self fireTapGesture:(UITapGestureRecognizer *)rec]) {
+                return YES;
+            }
+        }
+        candidate = candidate.superview;
+    }
+
+    // Nothing directly tappable on the view itself — fall back to the
+    // coordinate-based path at the view's centre.
+    CGPoint center = [view convertPoint:CGPointMake(CGRectGetMidX(view.bounds),
+                                                     CGRectGetMidY(view.bounds))
+                                 toView:nil];
+    DYLog(@"tapView: no direct target; point-tap fallback at %@", NSStringFromCGPoint(center));
+    return [self tapAtPoint:center];
+}
+
+/// Finds the tap gesture on the hit view or one of its ancestors and fires it.
 - (BOOL)fireTapGestureAtPoint:(CGPoint)point {
     UIWindow *window = [self frontWindow];
     if (!window) {
@@ -125,55 +215,9 @@
     UIView *candidate = hitView;
     for (NSUInteger level = 0; level < 8 && candidate; level++) {
         // Copy: Douyin can mutate its recogniser list while we walk it.
-        for (UIGestureRecognizer *recognizer in [candidate.gestureRecognizers copy]) {
-            if (![recognizer isKindOfClass:UITapGestureRecognizer.class] ||
-                !recognizer.enabled || !recognizer.view) {
-                continue;
-            }
-
-            @try {
-                // UIGestureRecognizer keeps its targets in a private array of
-                // UIGestureRecognizerTarget wrappers (_target / _action). KVC
-                // resolves "targets" to _targets. Everything below is guarded
-                // and falls back to the synthesised touch if it does not hold.
-                NSArray *wrappers = [recognizer valueForKey:@"targets"];
-                if (![wrappers isKindOfClass:NSArray.class] || wrappers.count == 0) {
-                    continue;
-                }
-
-                BOOL fired = NO;
-                for (id wrapper in wrappers) {
-                    id target = [wrapper valueForKey:@"target"];
-                    id actionValue = [wrapper valueForKey:@"action"];
-                    if (!target || !actionValue) {
-                        continue;
-                    }
-
-                    SEL action = NULL;
-                    if ([actionValue isKindOfClass:NSValue.class]) {
-                        action = (SEL)[(NSValue *)actionValue pointerValue];
-                    } else if ([actionValue isKindOfClass:NSString.class]) {
-                        action = NSSelectorFromString((NSString *)actionValue);
-                    }
-                    if (!action || ![target respondsToSelector:action]) {
-                        continue;
-                    }
-
-                    DYLog(@"tap: firing %@ gesture action on %@",
-                          NSStringFromClass(recognizer.class),
-                          NSStringFromClass([target class]));
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    [target performSelector:action withObject:recognizer];
-#pragma clang diagnostic pop
-                    fired = YES;
-                }
-
-                if (fired) {
-                    return YES;
-                }
-            } @catch (NSException *exception) {
-                DYLog(@"tap: gesture invocation failed: %@", exception.reason);
+        for (UIGestureRecognizer *rec in [candidate.gestureRecognizers copy]) {
+            if ([rec isKindOfClass:UITapGestureRecognizer.class] && [self fireTapGesture:(UITapGestureRecognizer *)rec]) {
+                return YES;
             }
         }
         candidate = candidate.superview;
