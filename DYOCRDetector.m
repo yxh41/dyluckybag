@@ -160,6 +160,11 @@ static dispatch_queue_t DYOCRQueue(void) {
 /// Emitted (rate limited) whenever the fast capture path fails, so a log from a
 /// live room explains itself instead of just reporting zero hits.
 - (void)logWindowDiagnostics:(UIWindow *)window {
+    // DYLog expands to ((void)0) in release builds, which would leave every
+    // variable below "set but not used" and fail the -Werror build. Keep the
+    // method itself defined in both configurations so the call sites compile;
+    // only its body is debug-only.
+#ifdef DEBUG
     static CFTimeInterval lastDiagnostic = 0.0;
     CFTimeInterval now = CACurrentMediaTime();
     if (now - lastDiagnostic < 30.0) {
@@ -184,6 +189,7 @@ static dispatch_queue_t DYOCRQueue(void) {
           stateName, NSStringFromClass(window.class), window.isKeyWindow, window.hidden,
           window.alpha, window.windowLevel, NSStringFromCGRect(window.bounds),
           (long)windowCount, NSStringFromCGSize(UIScreen.mainScreen.bounds.size));
+#endif
 }
 
 #pragma mark - OCR
@@ -283,6 +289,8 @@ static dispatch_queue_t DYOCRQueue(void) {
 /// Dump what the recogniser actually read. Without this a log can only ever say
 /// "N hits", which never explains why 福袋 was not among them.
 - (void)logHits:(NSArray<DYTextHit *> *)hits {
+    // Debug-only body for the same reason as logWindowDiagnostics: (see above).
+#ifdef DEBUG
     if (hits.count == 0) {
         return;
     }
@@ -296,6 +304,7 @@ static dispatch_queue_t DYOCRQueue(void) {
             hit.confidence];
     }
     DYLog(@"%@", line);
+#endif
 }
 
 #pragma mark - Coordinate conversion
