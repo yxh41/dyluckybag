@@ -33,6 +33,12 @@ static const NSTimeInterval kFastInterval = 1.5;
 static const NSTimeInterval kSlowInterval = 6.0;
 static const NSInteger kQuietThreshold = 10;
 
+// How many times -attemptCommentSend: probes for the comment box / follow-confirm
+// dialog before giving up and counting the bag as a plain join. Bumped above the
+// old 2 because the fan-club confirmation flow consumes a pass or two while the
+// dialog animates in and out.
+static const NSInteger kCommentMaxAttempts = 4;
+
 @interface DYEngine ()
 @property (nonatomic) NSTimer *timer;
 @property (nonatomic) BOOL scanning;
@@ -403,9 +409,28 @@ static const NSInteger kQuietThreshold = 10;
         // exception that escapes here would take down Douyin. Guard it so a
         // failure degrades to a logged skip instead of a host crash.
         @try {
-        // Some bags gate commenting behind 关注 / 加入粉丝团. Tap it first when
-        // the user opted in; otherwise just note it (the send will likely fail,
-        // which we report honestly instead of faking a join).
+        // A confirmation dialog (关注 / 加入粉丝团 confirm) blocks the comment
+        // box. If one is up, tap 确定/确认 and wait for the next pass to resolve.
+        DYViewHit *confirmDialog = [DYViewDetector firstControlWithTextContainingAny:@[ @"确定", @"确认" ]];
+        if (confirmDialog) {
+            if (attempt < kCommentMaxAttempts) {
+                DYLog(@"follow gate: confirming join ('%@')", confirmDialog.text);
+                [[DYTouch shared] tapView:confirmDialog.view];
+                DYLog(@"comment send: confirmation dialog up, retrying (attempt %ld)", (long)attempt);
+                [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
+                return;
+            }
+            DYLog(@"comment flow: confirmation never dismissed — plain bag, counting join");
+            [[DYConfig shared] incrementJoinCount];
+            [[DYConfig shared] synchronize];
+            [strongSelf updateStatus:@"已参与（关注确认未完成）"];
+            [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
+            return;
+        }
+
+        // No blocking dialog — tap any follow / fan-club gate that isn't already
+        // resolved. The user must have autoFollowForBags on; otherwise this is a
+        // no-op and a gated bag will simply fail to comment (reported honestly).
         [strongSelf handleFollowGate];
 
         // Resolve the 口令 to post. The card never shows it at detection time;
@@ -422,7 +447,7 @@ static const NSInteger kQuietThreshold = 10;
             // No comment box appeared. Two cases:
             //  - a plain bag that joins straight on 参与 (no sheet) -> count it;
             //  - a 口令 bag whose sheet is still animating in -> retry.
-            if (attempt < 2) {
+            if (attempt < kCommentMaxAttempts) {
                 DYLog(@"comment send: input not ready (attempt %ld), retrying", (long)attempt);
                 [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
                 return;
@@ -520,7 +545,7 @@ static const NSInteger kQuietThreshold = 10;
 
         DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
         if (!send) {
-            if (attempt < 2) {
+            if (attempt < kCommentMaxAttempts) {
                 DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
                 [self attemptCommentSend:comment attempt:attempt + 1];
                 return;
@@ -631,15 +656,23 @@ static const NSInteger kQuietThreshold = 10;
     DYLog(@"filled comment input with %lu chars", (unsigned long)text.length);
 }
 
-/// Taps a 关注 / 加入粉丝团 gate when present and the user opted in.
+/// Taps a 关注 / 加入粉丝团 gate when present and the user opted in. Some 口令
+/// bags require joining the fan club (or following the host) before the comment
+/// box will accept input; tapping the gate here lets the comment flow proceed.
+/// The matching confirmation dialog ("确定加入粉丝团？") is handled separately in
+/// -attemptCommentSend:, which defers the send until 确定/确认 is tapped.
 - (void)handleFollowGate {
-    DYViewHit *gate = [DYViewDetector firstControlWithTextContainingAny:@[ @"关注", @"加入粉丝团", @"加入团" ]];
+    if (![DYConfig shared].autoFollowForBags) {
+        return;
+    }
+    DYViewHit *gate = [DYViewDetector firstControlWithTextContainingAny:@[ @"关注", @"加入粉丝团", @"加入团", @"立即加入" ]];
     if (!gate) {
         return;
     }
-    if (![DYConfig shared].autoFollowForBags) {
-        DYLog(@"follow gate detected ('%@') but autoFollowForBags is OFF — comment may be blocked",
-              gate.text);
+    NSString *label = gate.text ?: @"";
+    if ([label containsString:@"已"]) {
+        // Already following / already in the fan club (e.g. "已关注",
+        // "已加入粉丝团") — nothing to tap, and re-tapping would be wrong.
         return;
     }
     DYLog(@"follow gate: tapping '%@'", gate.text);

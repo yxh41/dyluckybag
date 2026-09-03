@@ -15,25 +15,40 @@
 // Douyin's sheet present/dismiss transitions a subview can be freed while we
 // enumerate it. Touching that freed view faults with EXC_BAD_ACCESS / SIGSEGV —
 // a *signal*, which @try/@catch cannot intercept. We recover by siglongjmp-ing
-// out of the handler and returning an empty result for that pass.
+// out of the handler, but only for the single node (subtree) being walked; the
+// rest of the tree keeps being searched, so a transient fault never blanks the
+// whole scan (that all-or-nothing behaviour is exactly what made auto-comment
+// silently degrade to a plain join on every animated sheet).
 //
-// Recovery design (final, 2026-09-03): we do NOT install our own SIGSEGV/SIGBUS
-// handler. On a jailbroken device several parties fight over those dispositions
-// (the host app's crash reporter, other tweaks); whoever installed LAST wins, so a
-// guard that sigactions once can silently lose the signal and the host's handler
-// reports the crash instead — exactly what happened with the 12:02 report
-// (verified=1 yet the fault still landed in DYCrashLog's DYSignalHandler).
+// Recovery design (final 2026-09-03, hardened same day): we do NOT install our
+// own SIGSEGV/SIGBUS handler. On a jailbroken device several parties fight over
+// those dispositions (the host app's crash reporter, other tweaks); whoever
+// installed LAST wins, so a guard that sigactions once can silently lose the
+// signal and the host's handler reports the crash instead — exactly what happened
+// with the 12:02 report (verified=1 yet the fault still landed in DYCrashLog's
+// DYSignalHandler).
 //
 // Instead we hook DYCrashLog's *pre-handler*: DYSignalHandler sits at the bottom
 // of the chain on device (every report so far shows it at frame 0), so it is the
 // stable handler we can always rely on being consulted. The pre-handler checks a
-// thread-local "are we mid-walk" flag (depth); if so it siglongjmp-outs of the
-// fault. No disposition contest, so it cannot be displaced. Genuine crashes
-// outside a walk return 0 and are reported in full as before.
+// thread-local guard stack (jmpTop); if a guarded scope is active it siglongjmp-s
+// out of the fault to the *innermost* scope, which then skips only that node's
+// subtree. No disposition contest, so it cannot be displaced. Genuine crashes
+// outside any guarded scope return 0 and are reported in full as before.
+
+// How deep the guard stack can nest. The view tree is shallow in practice; this
+// ceiling is a safety stop so a pathological hierarchy can never overflow the
+// jmp buffer array.
+#define DY_WALK_GUARD_DEPTH 16
 
 typedef struct {
-    int depth;        // >0 while this thread is inside a guarded walk
-    sigjmp_buf jmp;   // where a fault on this thread jumps back to
+    // jmpTop is the index of the currently-active (innermost) guard. >= 0 means
+    // we are inside at least one guarded scope and a fault should be recovered.
+    // -1 means no guard is active. We no longer use a single `depth` flag: a
+    // fault anywhere must longjmp to the *innermost* guard so only the offending
+    // subtree is skipped, never the whole walk.
+    int jmpTop;
+    sigjmp_buf jmp[DY_WALK_GUARD_DEPTH];
 } DYWalkState;
 
 static pthread_key_t gDYWalkKey;
@@ -56,6 +71,7 @@ static DYWalkState *DYWalkStateForCurrentThread(void) {
     DYWalkState *st = (DYWalkState *)pthread_getspecific(gDYWalkKey);
     if (!st) {
         st = (DYWalkState *)calloc(1, sizeof(DYWalkState));
+        st->jmpTop = -1;
         pthread_setspecific(gDYWalkKey, st);
     }
     return st;
@@ -75,15 +91,16 @@ static DYWalkState *DYWalkStateNoAlloc(void) {
 // 0 to let DYCrashLog report it normally. DYSignalHandler is the always-present
 // handler on device, so this hook is the reliable recovery point regardless of who
 // currently owns SIGSEGV. Must stay async-signal-safe: no Foundation, no alloc.
+//
+// A fault inside any guarded scope longjmps to the innermost guard's jmp buffer.
+// That scope then skips its subtree and the walk continues from the parent —
+// so one freed view costs only its own branch, never the whole traversal.
 static int DYGuardPreHandler(int sig) {
     (void)sig;
     DYWalkState *st = DYWalkStateNoAlloc();
-    if (st && st->depth > 0) {
-        // A fault inside a walk we are guarding. Disarm first so a repeat fault
-        // at the same spot chains out instead of looping forever.
-        st->depth = 0;
-        DYCrashLogWriteLine("guard: recovered via DYCrashLog pre-handler — walk aborted, no crash");
-        siglongjmp(st->jmp, 1);
+    if (st && st->jmpTop >= 0) {
+        DYCrashLogWriteLine("guard: recovered via DYCrashLog pre-handler — subtree skipped, no crash");
+        siglongjmp(st->jmp[st->jmpTop], 1);
         // siglongjmp never returns.
     }
     return 0;
@@ -97,39 +114,47 @@ static void DYGuardArm(void) {
     DYCrashLogWriteLine("guard: pre-handler armed (recovery via DYCrashLog chain, no sigaction contest)");
 }
 
-// Runs body(); returns NO if a fault aborted it, YES otherwise.
-static BOOL DYGuardedWalk(void (^body)(void)) {
-    if (!body) {
-        return YES;
-    }
-    // Arm the recovery hook once (on the first walk). It hooks DYCrashLog's
-    // signal handler, which is the always-present bottom of the chain, so we are
-    // guaranteed to be consulted for every fault — no sigaction disposition contest.
+static void DYGuardArmIfNeeded(void) {
     pthread_once(&gDYGuardArmOnce, DYGuardArm);
+}
 
+// Enters a guarded scope around one view-tree node (and its subtree). Returns
+// YES to run the node's body; returns NO when called after a fault longjmp'd
+// back here, meaning the node's subtree was skipped. The caller MUST pair a YES
+// return with DYGuardExit() (in @finally) once the node is processed.
+//
+// Nesting: each active scope pushes its own jmp buffer, so a fault longjmps to
+// exactly the scope that owns the offending node — siblings and ancestors keep
+// being searched. The stack is capped at DY_WALK_GUARD_DEPTH; deeper nodes run
+// unguarded (a fault there aborts the walk, which is safer than overflowing).
+static BOOL DYGuardEnter(void) {
+    DYGuardArmIfNeeded();
     DYWalkState *st = DYWalkStateForCurrentThread();
     if (!st) {
-        body();
-        return YES;
+        return YES;   // no per-thread state: walk unprotected
     }
-    if (st->depth > 0) {
-        // Nested walk — the outer guard already covers this thread.
-        body();
-        return YES;
+    if (st->jmpTop + 1 >= DY_WALK_GUARD_DEPTH) {
+        return YES;   // guard stack full: walk this node unprotected
     }
-    if (sigsetjmp(st->jmp, 1) != 0) {
-        // Re-fetch rather than trust `st` across the longjmp.
-        DYWalkState *again = DYWalkStateNoAlloc();
-        if (again) {
-            again->depth = 0;
-        }
-        DYLog(@"viewdetect: traversal hit a freed view (EXC_BAD_ACCESS) — aborted defensively");
+    st->jmpTop += 1;
+    if (sigsetjmp(st->jmp[st->jmpTop], 1) != 0) {
+        // Arrived here via a fault longjmp: this node (and its subtree) is
+        // being skipped. Restore the stack top and tell the caller to skip.
+        st->jmpTop -= 1;
         return NO;
     }
-    st->depth = 1;
-    body();
-    st->depth = 0;
     return YES;
+}
+
+// Pops the innermost guard scope. Call from @finally after a DYGuardEnter()==YES.
+static void DYGuardExit(void) {
+    DYWalkState *st = DYWalkStateNoAlloc();
+    if (!st) {
+        return;
+    }
+    if (st->jmpTop >= 0) {
+        st->jmpTop -= 1;
+    }
 }
 
 @implementation DYViewHit
@@ -232,37 +257,50 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
         return;
     }
 
-    NSString *text = [self readableTextOfView:view];
-    if (text.length) {
-        NSString *compact = [text stringByReplacingOccurrencesOfString:@" " withString:@""];
-        for (NSString *kw in keywords) {
-            NSString *ckw = [kw stringByReplacingOccurrencesOfString:@" " withString:@""];
-            if ([compact rangeOfString:ckw options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                DYViewHit *hit = [[DYViewHit alloc] init];
-                hit.text = text;
-                hit.view = view;
-                hit.isControl = [view isKindOfClass:UIControl.class] || view.gestureRecognizers.count > 0;
-                UIWindow *win = view.window ?: [self frontWindow];
-                if (win) {
-                    hit.screenRect = [view convertRect:view.bounds toView:nil];
-                } else {
-                    hit.screenRect = view.frame;
+    // Guard this single node (and its subtree) as one unit. If the view is freed
+    // mid-traversal (Douyin tearing down the 口令 sheet), the signal pre-handler
+    // longjmps back here and we skip ONLY this node's subtree — every sibling and
+    // the rest of the tree keep being searched, so a transient fault can no longer
+    // blank out the entire scan the way the old whole-walk abort did.
+    if (!DYGuardEnter()) {
+        return;   // this node faulted earlier and was skipped
+    }
+    @try {
+        NSString *text = [self readableTextOfView:view];
+        if (text.length) {
+            NSString *compact = [text stringByReplacingOccurrencesOfString:@" " withString:@""];
+            for (NSString *kw in keywords) {
+                NSString *ckw = [kw stringByReplacingOccurrencesOfString:@" " withString:@""];
+                if ([compact rangeOfString:ckw options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    DYViewHit *hit = [[DYViewHit alloc] init];
+                    hit.text = text;
+                    hit.view = view;
+                    hit.isControl = [view isKindOfClass:UIControl.class] || view.gestureRecognizers.count > 0;
+                    UIWindow *win = view.window ?: [self frontWindow];
+                    if (win) {
+                        hit.screenRect = [view convertRect:view.bounds toView:nil];
+                    } else {
+                        hit.screenRect = view.frame;
+                    }
+                    [out addObject:hit];
+                    break;   // one keyword hit per view is enough
                 }
-                [out addObject:hit];
-                break;   // one keyword hit per view is enough
             }
         }
-    }
 
-    // Hold the subview list strongly for the duration of the recursion. Douyin
-    // tears down parts of the 口令 sheet while we walk it; UIKit then releases
-    // those views and any pointer we already grabbed becomes dangling, and the
-    // next message to it faults with EXC_BAD_ACCESS. Retaining our own copy
-    // keeps every child alive until we are done with it, which removes the
-    // use-after-free without needing the signal guard at all.
-    NSArray<UIView *> *subs = [view.subviews copy];
-    for (UIView *sub in subs) {
-        [self walk:sub keywords:keywords into:out depth:depth + 1];
+        // Hold the subview list strongly for the duration of the recursion. Douyin
+        // tears down parts of the 口令 sheet while we walk it; UIKit then releases
+        // those views and any pointer we already grabbed becomes dangling, and the
+        // next message to it faults with EXC_BAD_ACCESS. Retaining our own copy
+        // keeps every child alive until we are done with it.
+        NSArray<UIView *> *subs = [view.subviews copy];
+        for (UIView *sub in subs) {
+            [self walk:sub keywords:keywords into:out depth:depth + 1];
+        }
+    } @catch (NSException *exception) {
+        DYLog(@"viewdetect: traversal threw: %@", exception.reason);
+    } @finally {
+        DYGuardExit();
     }
 }
 
@@ -272,19 +310,10 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
         return @[];
     }
     NSMutableArray<DYViewHit *> *out = [NSMutableArray array];
-    BOOL ok = DYGuardedWalk(^{
-        @try {
-            [self walk:window keywords:keywords into:out depth:0];
-        } @catch (NSException *exception) {
-            DYLog(@"viewdetect: traversal threw: %@", exception.reason);
-        }
-    });
-    if (!ok) {
-        // A freed view was hit mid-walk (EXC_BAD_ACCESS). Abort this pass rather
-        // than crash the host; the next scan re-detects on a stable tree.
-        DYLog(@"viewdetect: traversal hit a freed view (EXC_BAD_ACCESS) — aborted defensively; returning no hits this pass");
-        return @[];
-    }
+    // Per-node guarding (inside -walk:) contains any freed-view fault to its own
+    // subtree, so the search always returns whatever it managed to collect —
+    // never an all-or-nothing empty result like the old whole-walk abort.
+    [self walk:window keywords:keywords into:out depth:0];
     return out;
 }
 
@@ -301,14 +330,27 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
         return @[];
     }
     NSMutableArray<DYViewHit *> *out = [NSMutableArray array];
-    void (^walk)(UIView *, NSUInteger) = nil;
-    walk = ^(UIView *view, NSUInteger depth) {
-        if (depth > 40) {
-            return;
-        }
-        if (view.hidden || view.alpha < 0.01) {
-            return;
-        }
+    [self walkInputs:window into:out depth:0];
+    return out;
+}
+
++ (void)walkInputs:(UIView *)view
+              into:(NSMutableArray<DYViewHit *> *)out
+             depth:(NSUInteger)depth {
+    if (depth > 40) {
+        return;
+    }
+    if (view.hidden || view.alpha < 0.01) {
+        return;
+    }
+    // Per-node guard, same as -walk:. A freed view anywhere in the sheet is
+    // skipped as just its own subtree; the comment box (which lives in a
+    // different branch) is still found, so attemptCommentSend no longer degrades
+    // to a plain join just because the sheet was mid-animation.
+    if (!DYGuardEnter()) {
+        return;
+    }
+    @try {
         if ([view isKindOfClass:UITextField.class] || [view isKindOfClass:UITextView.class]) {
             DYViewHit *hit = [[DYViewHit alloc] init];
             hit.text = [self readableTextOfView:view];
@@ -317,28 +359,15 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
             hit.screenRect = [view convertRect:view.bounds toView:nil];
             [out addObject:hit];
         }
-        // Same reasoning as +walk:...: retain the children before recursing so a
-        // concurrent sheet teardown cannot leave us messaging a dead view.
         NSArray<UIView *> *subs = [view.subviews copy];
         for (UIView *sub in subs) {
-            walk(sub, depth + 1);
+            [self walkInputs:sub into:out depth:depth + 1];
         }
-    };
-    BOOL ok = DYGuardedWalk(^{
-        @try {
-            walk(window, 0);
-        } @catch (NSException *exception) {
-            DYLog(@"viewdetect: input traversal threw: %@", exception.reason);
-        }
-    });
-    if (!ok) {
-        // A freed view was hit mid-walk (EXC_BAD_ACCESS) — this is the exact crash
-        // from the 2026-09-02 report. Return empty so attemptCommentSend retries
-        // (attempt<2) on a stable tree instead of touching a dead view.
-        DYLog(@"viewdetect: input traversal hit a freed view (EXC_BAD_ACCESS) — aborted defensively; returning no inputs");
-        return @[];
+    } @catch (NSException *exception) {
+        DYLog(@"viewdetect: input traversal threw: %@", exception.reason);
+    } @finally {
+        DYGuardExit();
     }
-    return out;
 }
 
 + (DYViewHit *)firstInputField {
