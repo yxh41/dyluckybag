@@ -1,63 +1,151 @@
 #import "DYViewDetector.h"
 #import "DYLog.h"
+#import "DYCrashLog.h"
 #import <setjmp.h>
 #import <signal.h>
 #import <pthread.h>
+#import <errno.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 
 #pragma mark - Crash-safe view-tree traversal
 
 // A view-injection tweak cannot avoid walking UIKit's live view tree, and during
-// Douyin's sheet present/dismiss transitions a subview in the hierarchy can be
-// freed while we enumerate it. Touching that freed view faults with
-// EXC_BAD_ACCESS / SIGSEGV — which @try/@catch CANNOT intercept (it is a signal,
-// not an Objective-C throw). So we wrap each traversal in a scoped
-// SIGSEGV/SIGBUS guard: if a fault fires mid-walk we siglongjmp out and return
-// an empty result, turning a host crash into a graceful skip. The
-// previously-installed handler (DYCrashLog) is saved and restored, so genuine
-// crashes elsewhere still go to it and produce a full report.
-static sigjmp_buf gDYWalkJmp;
-static volatile sig_atomic_t gDYWalkArmed = 0;
-static pthread_t gDYWalkThread;
-static struct sigaction gDYWalkPrevSeg, gDYWalkPrevBus;
+// Douyin's sheet present/dismiss transitions a subview can be freed while we
+// enumerate it. Touching that freed view faults with EXC_BAD_ACCESS / SIGSEGV —
+// a *signal*, which @try/@catch cannot intercept. We recover by siglongjmp-ing
+// out of the handler and returning an empty result for that pass.
+//
+// v2 (2026-09-03): v1 installed and restored its handlers around every single
+// walk, and on device it never caught anything — the 11:34 report shows
+// DYGuardedWalk on the stack while the fault went straight to DYCrashLog's
+// DYSignalHandler, so the per-call sigaction window was not in effect at fault
+// time. This version installs ONCE (lazily, on the first walk, so DYCrashLog is
+// already in place and becomes our chain target) and then never touches the
+// disposition again, removing the whole install/restore window. State lives in
+// thread-local storage so nesting and other threads both behave, and every step
+// is written to the crash log so the next report says exactly what the guard did
+// and whether the kernel accepted it.
 
-static void DYWalkFaultHandler(int sig) {
-    if (gDYWalkArmed && pthread_self() == gDYWalkThread) {
-        gDYWalkArmed = 0;
-        siglongjmp(gDYWalkJmp, 1);
+typedef struct {
+    int depth;        // >0 while this thread is inside a guarded walk
+    sigjmp_buf jmp;   // where a fault on this thread jumps back to
+} DYWalkState;
+
+static pthread_key_t gDYWalkKey;
+static volatile int gDYWalkKeyReady = 0;
+static pthread_once_t gDYWalkKeyOnce = PTHREAD_ONCE_INIT;
+static pthread_once_t gDYGuardInstallOnce = PTHREAD_ONCE_INIT;
+
+// Dispositions captured at install time (normally DYCrashLog's handler), so a
+// fault outside a walk still produces the full DYCrashLog report.
+static struct sigaction gPrevSeg, gPrevBus;
+static int gGuardInstalled = 0;
+
+static void DYMakeWalkKey(void) {
+    if (pthread_key_create(&gDYWalkKey, free) == 0) {
+        gDYWalkKeyReady = 1;
     }
-    // Fault on another thread, or not during a walk: defer to the real handler
-    // (DYCrashLog). Restore its disposition and re-raise so it runs as normal.
-    struct sigaction *prev = (sig == SIGSEGV) ? &gDYWalkPrevSeg : &gDYWalkPrevBus;
+}
+
+// Normal context: may allocate.
+static DYWalkState *DYWalkStateForCurrentThread(void) {
+    pthread_once(&gDYWalkKeyOnce, DYMakeWalkKey);
+    if (!gDYWalkKeyReady) {
+        return NULL;
+    }
+    DYWalkState *st = (DYWalkState *)pthread_getspecific(gDYWalkKey);
+    if (!st) {
+        st = (DYWalkState *)calloc(1, sizeof(DYWalkState));
+        pthread_setspecific(gDYWalkKey, st);
+    }
+    return st;
+}
+
+// Signal context: never allocates and never calls pthread_once — neither is safe
+// inside a SIGSEGV handler.
+static DYWalkState *DYWalkStateNoAlloc(void) {
+    if (!gDYWalkKeyReady) {
+        return NULL;
+    }
+    return (DYWalkState *)pthread_getspecific(gDYWalkKey);
+}
+
+static void DYGuardHandler(int sig) {
+    DYWalkState *st = DYWalkStateNoAlloc();
+    if (st && st->depth > 0) {
+        // A fault inside a walk we are guarding. Disarm first so a repeat fault
+        // at the same spot chains out instead of looping forever.
+        st->depth = 0;
+        DYCrashLogWriteLine("guard: caught fault inside walk — recovering via siglongjmp");
+        siglongjmp(st->jmp, 1);
+    }
+
+    // Fault outside any walk: hand it to whoever was installed before us
+    // (DYCrashLog) so genuine crashes are still reported in full.
+    DYCrashLogWriteLine("guard: fault outside a walk — chaining to previous handler");
+    struct sigaction *prev = (sig == SIGSEGV) ? &gPrevSeg : &gPrevBus;
     sigaction(sig, prev, NULL);
     raise(sig);
 }
 
-// Runs body(); returns NO if a fault aborted the walk, YES otherwise.
+static void DYGuardInstall(void) {
+    struct sigaction sa, check;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = DYGuardHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    int installed = 0;
+    if (sigaction(SIGSEGV, &sa, &gPrevSeg) == 0 && sigaction(SIGBUS, &sa, &gPrevBus) == 0) {
+        // Verify the kernel actually accepted our handler — the question the
+        // previous build left unanswered.
+        memset(&check, 0, sizeof(check));
+        sigaction(SIGSEGV, NULL, &check);
+        installed = (check.sa_handler == DYGuardHandler);
+    }
+
+    char line[256];
+    snprintf(line, sizeof(line),
+             "guard: install segv_prev=%p bus_prev=%p verified=%d errno=%d",
+             (void *)gPrevSeg.sa_handler, (void *)gPrevBus.sa_handler, installed, errno);
+    DYCrashLogWriteLine(line);
+
+    gGuardInstalled = installed;
+}
+
+// Runs body(); returns NO if a fault aborted it, YES otherwise.
 static BOOL DYGuardedWalk(void (^body)(void)) {
     if (!body) {
         return YES;
     }
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = DYWalkFaultHandler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGSEGV, &sa, &gDYWalkPrevSeg);
-    sigaction(SIGBUS, &sa, &gDYWalkPrevBus);
+    // Lazy install: by the first walk the tweak %ctor has already run
+    // DYCrashLogInstall(), so gPrevSeg/gPrevBus are DYCrashLog's handler.
+    pthread_once(&gDYGuardInstallOnce, DYGuardInstall);
 
-    gDYWalkThread = pthread_self();
-    gDYWalkArmed = 1;
-    int faulted = sigsetjmp(gDYWalkJmp, 1);
-    if (faulted) {
-        gDYWalkArmed = 0;
-        sigaction(SIGSEGV, &gDYWalkPrevSeg, NULL);
-        sigaction(SIGBUS, &gDYWalkPrevBus, NULL);
+    DYWalkState *st = DYWalkStateForCurrentThread();
+    if (!st || !gGuardInstalled) {
+        body();
+        return YES;
+    }
+    if (st->depth > 0) {
+        // Nested walk — the outer guard already covers this thread.
+        body();
+        return YES;
+    }
+    if (sigsetjmp(st->jmp, 1) != 0) {
+        // Re-fetch rather than trust `st` across the longjmp.
+        DYWalkState *again = DYWalkStateNoAlloc();
+        if (again) {
+            again->depth = 0;
+        }
+        DYLog(@"viewdetect: traversal hit a freed view (EXC_BAD_ACCESS) — aborted defensively");
         return NO;
     }
+    st->depth = 1;
     body();
-    gDYWalkArmed = 0;
-    sigaction(SIGSEGV, &gDYWalkPrevSeg, NULL);
-    sigaction(SIGBUS, &gDYWalkPrevBus, NULL);
+    st->depth = 0;
     return YES;
 }
 

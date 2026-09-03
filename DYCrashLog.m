@@ -161,3 +161,7 @@ void DYCrashLogInstall(void) {
     DYWriteLine("DYCrashLog installed (pid captured at crash time). "
                 "If a crash occurs, send dyluckybag_crash.log alongside the OS report.");
 }
+
+void DYCrashLogWriteLine(const char *line) {
+    DYWriteLine(line);
+}

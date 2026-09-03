@@ -17,6 +17,12 @@ extern "C" {
 // Install exactly once, from the tweak %ctor, as early as possible.
 void DYCrashLogInstall(void);
 
+// Async-signal-safe line writer into the same log. Use this from signal
+// handlers and guarded-recovery paths: it touches only open(2)/write(2)/close(2),
+// so it is safe inside a SIGSEGV context where NSLog and Foundation are not.
+// `line` must be a plain C string.
+void DYCrashLogWriteLine(const char *line);
+
 #ifdef __cplusplus
 }
 #endif
