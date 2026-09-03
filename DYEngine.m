@@ -431,12 +431,14 @@ static const NSInteger kQuietThreshold = 10;
               input:(DYViewHit *)input
            prefill:(NSString *)prefill
            attempt:(NSInteger)attempt {
-    UIWindow *win = [DYViewDetector frontWindow];
     UIView *inputView = input.view;
     // The comment sheet is animated/popped by Douyin; if the field we captured
-    // is no longer on screen, acting on a torn-down control can crash the host.
-    // Skip honestly instead of touching a stale view.
-    if (!inputView || (win && ![inputView isDescendantOfView:win])) {
+    // is no longer attached to a live window, acting on a torn-down control can
+    // crash the host. Skip honestly instead of touching a stale view.
+    // (Douyin often presents the sheet in its own window, so we test the view's
+    // own window rather than comparing against the front window — the latter
+    // would false-skip a send whose control lives in a non-key window.)
+    if (!inputView || inputView.window == nil) {
         DYLog(@"fillAndSend: comment input no longer on screen — skipping");
         [self updateStatus:@"评论框已消失，参与未完成"];
         return;
@@ -463,7 +465,7 @@ static const NSInteger kQuietThreshold = 10;
         }
 
         UIView *sendView = send.view;
-        if (win && ![sendView isDescendantOfView:win]) {
+        if (sendView.window == nil) {
             DYLog(@"fillAndSend: 发送 button no longer on screen — skipping");
             [self updateStatus:@"发送按钮已消失，参与未完成"];
             return;

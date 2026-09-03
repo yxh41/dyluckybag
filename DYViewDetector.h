@@ -36,6 +36,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// First UIControl whose title contains any of `keywords`.
 + (nullable DYViewHit *)firstControlWithTextContainingAny:(NSArray<NSString *> *)keywords;
 
+/// The front-most application window. Exposed as a class method so other
+/// modules (e.g. the engine's fill/send path) can sanity-check that a view is
+/// still on screen before acting on it. Returns nil if no window is available.
++ (nullable UIWindow *)frontWindow;
+
 @end
 
 NS_ASSUME_NONNULL_END
