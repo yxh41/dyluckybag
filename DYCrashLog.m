@@ -26,6 +26,12 @@ static void (*gPrevSig[32])(int);
 // touching anything that allocates.
 static DYCrashLogPreHandler gPreHandler = NULL;
 
+// Forward declaration: DYCrashLogRetakeSignals() (just below) needs to install
+// DYSignalHandler, but that function is defined further down. Without this, the
+// compiler treats the call as an implicit int — which is a hard type error when
+// passing it to signal() (expects void(*)(int)).
+static void DYSignalHandler(int sig);
+
 void DYCrashLogSetPreHandler(DYCrashLogPreHandler handler) {
     gPreHandler = handler;
 }
@@ -35,12 +41,27 @@ void DYCrashLogRetakeSignals(void) {
     int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
     for (size_t i = 0; i < sizeof(signals) / sizeof(int); i++) {
         int sig = signals[i];
-        if (sig >= 0 && sig < 32) {
-            // Re-install our handler as the LAST one, chaining whoever was there.
-            // This defeats displacement: right before a vulnerable tree walk we own
-            // the signal, so our recovery pre-handler gets consulted no matter who
-            // installed last.
-            void (*prev)(int) = signal(sig, DYSignalHandler);
+        if (sig < 0 || sig >= 32) {
+            continue;
+        }
+        // Query the current disposition WITHOUT changing it first. If we already
+        // own this signal (nobody displaced us since install), do nothing — the
+        // chain is already correct and re-installing would make signal() return
+        // OURSELVES as the "previous" handler, which would chain into an infinite
+        // loop on the next fault (DYSignalHandler -> gPrevSig -> DYSignalHandler).
+        struct sigaction cur;
+        if (sigaction(sig, NULL, &cur) != 0) {
+            continue;
+        }
+        if (cur.sa_handler == DYSignalHandler) {
+            continue;   // already ours — leave the chain intact
+        }
+        // We were displaced by another tweak / the app's reporter. Re-install as
+        // the LAST disposition, chaining to whatever was there so its handler still
+        // runs after ours. Only record the previous handler when it is genuinely
+        // someone else's (never our own, which would self-loop).
+        void (*prev)(int) = signal(sig, DYSignalHandler);
+        if (prev != DYSignalHandler) {
             gPrevSig[sig] = prev;
         }
     }
