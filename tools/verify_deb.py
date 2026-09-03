@@ -20,6 +20,7 @@ DEFAULT_TARGETS = [
     "发送按钮已消失，参与未完成",
     "评论发送异常，已跳过",
     "评论可能未发出",
+    "检测/参与异常，已跳过",
     # sanity: prior comment-path strings must still be present
     "已发评论",
     "comment sent",
@@ -28,6 +29,7 @@ DEFAULT_TARGETS = [
     # method-name markers confirming the guards compiled in
     "attemptCommentSend",
     "verifyCommentSent",
+    "handleHits",
 ]
 
 

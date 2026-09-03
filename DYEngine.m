@@ -153,6 +153,11 @@ static const NSInteger kQuietThreshold = 10;
 #pragma mark - Decision making
 
 - (void)handleHits:(NSArray<DYTextHit *> *)hits {
+    // The whole scan→decision→tap pipeline runs on the main run loop (it is
+    // invoked directly from the OCR completion block). Any exception that escapes
+    // here would crash Douyin, so guard the entire handler and degrade to a logged
+    // skip instead of taking down the host.
+    @try {
     // Decide whether a lucky bag is on screen. OCR covers the case where the
     // screen capture succeeded; the view-tree scan needs no capture at all, so
     // it still finds the 福袋 / 参与 controls when drawViewHierarchyInRect
@@ -278,6 +283,10 @@ static const NSInteger kQuietThreshold = 10;
         self.lastKeyword = nil;
     } else {
         [self updateStatus:@"点击失败：未找到可响应的控件"];
+    }
+    } @catch (NSException *exception) {
+        DYLog(@"handleHits: caught exception (%@): %@", exception.name, exception.reason);
+        [self updateStatus:@"检测/参与异常，已跳过"];
     }
 }
 
