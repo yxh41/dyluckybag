@@ -431,36 +431,60 @@ static const NSInteger kQuietThreshold = 10;
               input:(DYViewHit *)input
            prefill:(NSString *)prefill
            attempt:(NSInteger)attempt {
-    // Only overwrite the box when it is empty; a prefilled 口令 must be kept.
-    if (prefill.length == 0) {
-        [self fillInput:input.view withText:comment];
-    } else {
-        DYLog(@"comment box prefilled with '%@' — sending as-is", prefill);
-    }
-
-    DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
-    if (!send) {
-        if (attempt < 2) {
-            DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
-            [self attemptCommentSend:comment attempt:attempt + 1];
-            return;
-        }
-        DYLog(@"comment send: no 发送/发表/发布 button found");
-        [self updateStatus:@"发送按钮未找到，参与未完成"];
+    UIWindow *win = [DYViewDetector frontWindow];
+    UIView *inputView = input.view;
+    // The comment sheet is animated/popped by Douyin; if the field we captured
+    // is no longer on screen, acting on a torn-down control can crash the host.
+    // Skip honestly instead of touching a stale view.
+    if (!inputView || (win && ![inputView isDescendantOfView:win])) {
+        DYLog(@"fillAndSend: comment input no longer on screen — skipping");
+        [self updateStatus:@"评论框已消失，参与未完成"];
         return;
     }
 
-    BOOL ok = [[DYTouch shared] tapView:send.view];
-    if (ok) {
-        DYLog(@"comment sent: '%@'", comment);
-        [[DYConfig shared] incrementJoinCount];
-        [[DYConfig shared] synchronize];
-        [self updateStatus:[NSString stringWithFormat:@"已发评论：%@", comment]];
-        [self verifyCommentSent];
-    } else {
-        DYLog(@"comment send: tap on 发送 failed");
-        [self updateStatus:@"发送点击失败"];
-        // Tap failed — incomplete, do not count.
+    @try {
+        // Only overwrite the box when it is empty; a prefilled 口令 must be kept.
+        if (prefill.length == 0) {
+            [self fillInput:inputView withText:comment];
+        } else {
+            DYLog(@"comment box prefilled with '%@' — sending as-is", prefill);
+        }
+
+        DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
+        if (!send) {
+            if (attempt < 2) {
+                DYLog(@"comment send: 发送 button not ready (attempt %ld), retrying", (long)attempt);
+                [self attemptCommentSend:comment attempt:attempt + 1];
+                return;
+            }
+            DYLog(@"comment send: no 发送/发表/发布 button found");
+            [self updateStatus:@"发送按钮未找到，参与未完成"];
+            return;
+        }
+
+        UIView *sendView = send.view;
+        if (win && ![sendView isDescendantOfView:win]) {
+            DYLog(@"fillAndSend: 发送 button no longer on screen — skipping");
+            [self updateStatus:@"发送按钮已消失，参与未完成"];
+            return;
+        }
+
+        BOOL ok = [[DYTouch shared] tapView:sendView];
+        if (ok) {
+            DYLog(@"comment sent: '%@'", comment);
+            [[DYConfig shared] incrementJoinCount];
+            [[DYConfig shared] synchronize];
+            [self updateStatus:[NSString stringWithFormat:@"已发评论：%@", comment]];
+            [self verifyCommentSent];
+        } else {
+            DYLog(@"comment send: tap on 发送 failed");
+            [self updateStatus:@"发送点击失败"];
+            // Tap failed — incomplete, do not count.
+        }
+    } @catch (NSException *exception) {
+        DYLog(@"fillAndSend: caught exception (%@): %@", exception.name, exception.reason);
+        [self updateStatus:@"评论发送异常，已跳过"];
+        // An exception means the send did not complete — do not inflate the counter.
     }
 }
 
