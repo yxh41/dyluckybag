@@ -17,7 +17,7 @@ REPO = "yxh41/dyluckybag"
 SHA = sys.argv[1] if len(sys.argv) > 1 else "c102821"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "output/" + SHA
 MAX_WAIT = 40 * 60
-POLL = 20
+POLL = 45
 os.makedirs(OUT, exist_ok=True)
 
 

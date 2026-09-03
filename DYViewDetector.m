@@ -183,7 +183,14 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
         }
     }
 
-    for (UIView *sub in view.subviews) {
+    // Hold the subview list strongly for the duration of the recursion. Douyin
+    // tears down parts of the 口令 sheet while we walk it; UIKit then releases
+    // those views and any pointer we already grabbed becomes dangling, and the
+    // next message to it faults with EXC_BAD_ACCESS. Retaining our own copy
+    // keeps every child alive until we are done with it, which removes the
+    // use-after-free without needing the signal guard at all.
+    NSArray<UIView *> *subs = [view.subviews copy];
+    for (UIView *sub in subs) {
         [self walk:sub keywords:keywords into:out depth:depth + 1];
     }
 }
@@ -239,7 +246,10 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
             hit.screenRect = [view convertRect:view.bounds toView:nil];
             [out addObject:hit];
         }
-        for (UIView *sub in view.subviews) {
+        // Same reasoning as +walk:...: retain the children before recursing so a
+        // concurrent sheet teardown cannot leave us messaging a dead view.
+        NSArray<UIView *> *subs = [view.subviews copy];
+        for (UIView *sub in subs) {
             walk(sub, depth + 1);
         }
     };
