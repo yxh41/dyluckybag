@@ -361,6 +361,10 @@ static const NSInteger kQuietThreshold = 10;
             return;
         }
 
+        // The whole comment-resolution path runs on the main run loop; any
+        // exception that escapes here would take down Douyin. Guard it so a
+        // failure degrades to a logged skip instead of a host crash.
+        @try {
         // Some bags gate commenting behind 关注 / 加入粉丝团. Tap it first when
         // the user opted in; otherwise just note it (the send will likely fail,
         // which we report honestly instead of faking a join).
@@ -422,6 +426,10 @@ static const NSInteger kQuietThreshold = 10;
         }
 
         [strongSelf fillAndSend:comment input:input prefill:prefill attempt:attempt];
+        } @catch (NSException *exception) {
+            DYLog(@"attemptCommentSend: caught exception (%@): %@", exception.name, exception.reason);
+            [strongSelf updateStatus:@"评论发送异常，已跳过"];
+        }
     });
 }
 
@@ -589,12 +597,16 @@ static const NSInteger kQuietThreshold = 10;
         if (!strongSelf || !strongSelf.running) {
             return;
         }
+        @try {
         DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
         if (!send) {
             DYLog(@"comment verify: OK - 发送 button gone (comment posted)");
         } else {
             DYLog(@"comment verify: 发送 button still present - send may not have landed");
             [strongSelf updateStatus:@"评论可能未发出"];
+        }
+        } @catch (NSException *exception) {
+            DYLog(@"verifyCommentSent: caught exception (%@): %@", exception.name, exception.reason);
         }
     });
 }
