@@ -8,6 +8,45 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <mach/mach.h>
+#import <objc/runtime.h>
+
+#pragma mark - Crash-safe liveness probe (signal-free)
+
+// A view Douyin is tearing down mid-walk can be a dangling pointer; messaging it
+// faults with EXC_BAD_ACCESS (SIGSEGV), which @try/@catch cannot intercept and our
+// per-node signal guard may not catch either — on a jailbroken device with a dozen
+// other tweaks injecting into Aweme, DYCrashLog's handler is routinely displaced,
+// so the guard is unreliable. The only robust fix is to never dereference a dead
+// pointer: probe the object's header with vm_read_overwrite, which returns an
+// error instead of faulting. A tiny / unmapped pointer is rejected before we ever
+// send it a message — eliminating the 0x10-class crash.
+static BOOL DYMemReadable(void *addr, size_t len) {
+    if (!addr || len == 0) return NO;
+    vm_address_t val = 0;
+    mach_msg_type_number_t out = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)addr,
+                                         (vm_size_t)len,
+                                         (vm_address_t)&val,
+                                         &out);
+    return (kr == KERN_SUCCESS && out == (mach_msg_type_number_t)len);
+}
+
+static BOOL DYIsLiveObject(id p) {
+    uintptr_t addr = (uintptr_t)p;
+    if (addr < 0x1000) return NO;   // null / tiny (the 0x10 crash)
+    // Probe the isa word. If the object was freed (memory unmapped or reused),
+    // this fails and we skip it rather than faulting on the next message send.
+    if (!DYMemReadable((void *)addr, sizeof(uintptr_t))) return NO;
+    // Header is mapped, so object_getClass is safe; it yields a (possibly bogus)
+    // class without faulting. Verify that class pointer is itself mapped so the
+    // subsequent isKindOfClass:/property reads won't dereference a bad isa.
+    Class cls = object_getClass(p);
+    if (cls == Nil) return NO;
+    if (!DYMemReadable((void *)cls, sizeof(uintptr_t))) return NO;
+    return YES;
+}
 
 #pragma mark - Crash-safe view-tree traversal
 
@@ -215,6 +254,9 @@ static void DYGuardExit(void) {
 #pragma mark - Text extraction
 
 + (NSString *)readableTextOfView:(UIView *)view {
+    if (!DYIsLiveObject(view)) {
+        return @"";
+    }
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
 
     if ([view isKindOfClass:UILabel.class]) {
@@ -252,6 +294,13 @@ static void DYGuardExit(void) {
     depth:(NSUInteger)depth {
     if (depth > 40) {
         return;   // guard against pathological view hierarchies
+    }
+    // NEVER dereference a view Douyin is tearing down mid-walk: a dangling pointer
+    // faults with EXC_BAD_ACCESS (a signal @try/@catch cannot catch, and our signal
+    // guard may be displaced by another tweak's handler on a jailbroken device).
+    // Probe the object header with vm_read_overwrite — it errors instead of faulting.
+    if (!DYIsLiveObject(view)) {
+        return;
     }
     if (view.hidden || view.alpha < 0.01) {
         return;
@@ -295,6 +344,9 @@ static void DYGuardExit(void) {
         // keeps every child alive until we are done with it.
         NSArray<UIView *> *subs = [view.subviews copy];
         for (UIView *sub in subs) {
+            if (!DYIsLiveObject(sub)) {
+                continue;   // child freed while we enumerated — skip, don't fault
+            }
             [self walk:sub keywords:keywords into:out depth:depth + 1];
         }
     } @catch (NSException *exception) {
@@ -305,6 +357,11 @@ static void DYGuardExit(void) {
 }
 
 + (NSArray<DYViewHit *> *)findViewsWithTextContaining:(NSArray<NSString *> *)keywords {
+    // Re-assert our signal handler as the active one right before touching the
+    // tree. On a jailbroken device several tweaks fight over SIGSEGV/SIGBUS; the
+    // last installer wins, so re-taking here (chaining whoever was there) makes
+    // DYCrashLog's recovery pre-handler reachable again for this walk.
+    DYCrashLogRetakeSignals();
     UIWindow *window = [self frontWindow];
     if (!window) {
         return @[];
@@ -325,6 +382,7 @@ static void DYGuardExit(void) {
 #pragma mark - Input fields & controls
 
 + (NSArray<DYViewHit *> *)findInputFields {
+    DYCrashLogRetakeSignals();
     UIWindow *window = [self frontWindow];
     if (!window) {
         return @[];
@@ -338,6 +396,9 @@ static void DYGuardExit(void) {
               into:(NSMutableArray<DYViewHit *> *)out
              depth:(NSUInteger)depth {
     if (depth > 40) {
+        return;
+    }
+    if (!DYIsLiveObject(view)) {
         return;
     }
     if (view.hidden || view.alpha < 0.01) {
@@ -361,6 +422,9 @@ static void DYGuardExit(void) {
         }
         NSArray<UIView *> *subs = [view.subviews copy];
         for (UIView *sub in subs) {
+            if (!DYIsLiveObject(sub)) {
+                continue;
+            }
             [self walkInputs:sub into:out depth:depth + 1];
         }
     } @catch (NSException *exception) {
@@ -375,7 +439,7 @@ static void DYGuardExit(void) {
     // The comment box auto-focuses when the 口令 sheet opens, so the first
     // responder is almost always the field we want.
     for (DYViewHit *hit in all) {
-        if ([hit.view isFirstResponder]) {
+        if (DYIsLiveObject(hit.view) && [hit.view isFirstResponder]) {
             return hit;
         }
     }
@@ -385,7 +449,7 @@ static void DYGuardExit(void) {
 + (DYViewHit *)firstControlWithTextContaining:(NSString *)keyword {
     NSArray<DYViewHit *> *all = [self findViewsWithTextContaining:@[ keyword ]];
     for (DYViewHit *hit in all) {
-        if ([hit.view isKindOfClass:UIControl.class]) {
+        if (DYIsLiveObject(hit.view) && [hit.view isKindOfClass:UIControl.class]) {
             return hit;
         }
     }

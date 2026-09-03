@@ -20,6 +20,13 @@ static NSArray<NSString *> *const kWinPhrases = @[
     @"中奖啦", @"获得¥", @"奖品已发放", @"中奖记录"
 ];
 
+// 超级福袋 (super lucky bag): requires joining the shopping fan club (购物粉丝团)
+// AND posting a fixed, card-specified comment (shown as "发送评论：<text>"), unlike
+// a 口令 bag whose comment is a secret keyword revealed only after 参与.
+static NSString *const kWordSuperBag    = @"超级福袋";
+static NSString *const kWordSendComment = @"发送评论";
+static NSString *const kWordFanClubTask = @"福袋任务";
+
 // A tap landing within this radius of the previous tap is treated as the same
 // button, so we do not hammer "join" on every scan pass.
 static const CGFloat kTapProximity = 44.0;
@@ -37,7 +44,7 @@ static const NSInteger kQuietThreshold = 10;
 // dialog before giving up and counting the bag as a plain join. Bumped above the
 // old 2 because the fan-club confirmation flow consumes a pass or two while the
 // dialog animates in and out.
-static const NSInteger kCommentMaxAttempts = 4;
+static const NSInteger kCommentMaxAttempts = 6;
 
 @interface DYEngine ()
 @property (nonatomic) NSTimer *timer;
@@ -48,6 +55,8 @@ static const NSInteger kCommentMaxAttempts = 4;
 @property (nonatomic) CGPoint lastTapPoint;
 @property (nonatomic) CFTimeInterval lastTapTime;
 @property (nonatomic) NSString *lastKeyword;
+@property (nonatomic, copy) NSString *superBagComment;   // fixed comment a 超级福袋 prints on its card
+@property (nonatomic) BOOL superBagActive;               // re-detected every scan; NOT cleared at end of handleHits
 @property (nonatomic) NSInteger quietPasses;
 @property (nonatomic) NSTimeInterval currentInterval;
 
@@ -173,6 +182,11 @@ static const NSInteger kCommentMaxAttempts = 4;
     // here would crash Douyin, so guard the entire handler and degrade to a logged
     // skip instead of taking down the host.
     @try {
+    // Fresh per-scan super-bag state; re-detected just below. (Do NOT clear at the
+    // end of handleHits — the async comment flow reads superBagComment later.)
+    self.superBagComment = nil;
+    self.superBagActive = NO;
+
     // Decide whether a lucky bag is on screen. OCR covers the case where the
     // screen capture succeeded; the view-tree scan needs no capture at all, so
     // it still finds the 福袋 / 参与 controls when drawViewHierarchyInRect
@@ -220,6 +234,26 @@ static const NSInteger kCommentMaxAttempts = 4;
 
     // 3. Extract the keyword (口令) if the bag requires a comment to enter.
     [self captureKeywordFromHits:hits];
+
+    // 3b. 超级福袋 detection: it needs the shopping fan-club join (购物粉丝团) AND a
+    // fixed, card-specified comment ("发送评论：<text>"), unlike a 口令 bag whose
+    // comment is a secret keyword. Capture that comment so the comment flow can post
+    // it. Re-detected every scan (cleared at the top of handleHits).
+    BOOL superBag = [hits dy_firstHitContaining:kWordSuperBag] != nil
+                 || [DYViewDetector firstViewWithTextContaining:kWordSuperBag] != nil
+                 || [DYViewDetector firstViewWithTextContaining:kWordSendComment] != nil
+                 || [DYViewDetector firstViewWithTextContaining:kWordFanClubTask] != nil;
+    self.superBagActive = superBag;
+    if (superBag) {
+        NSString *c = [self captureSpecifiedCommentFromHits:hits];
+        if (c.length) {
+            self.superBagComment = c;
+            DYLog(@"super bag: captured specified comment '%@'", c);
+            [self updateStatus:[NSString stringWithFormat:@"超级福袋：已捕获评论「%@」", c]];
+        } else {
+            DYLog(@"super bag detected (comment not yet visible in OCR)");
+        }
+    }
 
     // 4. Already joined? Then we are waiting for the draw, not tapping again.
     if ((bagByOCR && [hits dy_firstHitContaining:@"已参与"]) || joinedView) {
@@ -433,13 +467,23 @@ static const NSInteger kCommentMaxAttempts = 4;
         // no-op and a gated bag will simply fail to comment (reported honestly).
         [strongSelf handleFollowGate];
 
-        // Resolve the 口令 to post. The card never shows it at detection time;
-        // Douyin reveals it only inside the comment sheet after 参与 opens it,
-        // and sometimes even prefills the box with it. Priority:
-        //   1. captured pre-tap (keyword arg / self.lastKeyword)
-        //   2. re-scanned from the now-open sheet
-        //   3. already typed into the box by Douyin (prefill) — send as-is
-        NSString *comment = (keyword.length > 0) ? keyword : [strongSelf captureKeywordFromSheet];
+        // Resolve what to post. Priority:
+        //   1. super-bag specified comment (captured from card/sheet) — wins for 超级福袋
+        //   2. 口令 captured pre-tap / from sheet (普通口令袋)
+        //   3. Douyin-prefilled box text (handled once the input is found)
+        //   4. OCR of the screen (handles 口令 rendered as image, or 发送评论 text)
+        NSString *comment = nil;
+        if (strongSelf.superBagComment.length > 0) {
+            comment = strongSelf.superBagComment;
+        } else if (keyword.length > 0) {
+            comment = keyword;
+        } else {
+            comment = [strongSelf captureKeywordFromSheet];
+        }
+        if (comment.length == 0) {
+            // super-bag comment may only be revealed once the sheet is open
+            comment = [strongSelf captureSpecifiedCommentFromSheet];
+        }
         NSString *prefill = nil;
 
         DYViewHit *input = [DYViewDetector firstInputField];
@@ -482,22 +526,20 @@ static const NSInteger kCommentMaxAttempts = 4;
                     [strongSelf updateStatus:@"评论框已消失，参与未完成"];
                     return;
                 }
-                NSString *ocrKw = nil;
-                for (DYTextHit *h in hits) {
-                    if ([h.text rangeOfString:kWordKeyword].location != NSNotFound) {
-                        NSString *kw = [strongSelf keywordFromText:h.text];
-                        if (kw.length) { ocrKw = kw; break; }
-                    }
-                }
+                NSString *ocrKw = [strongSelf resolveCommentFromHits:hits];
                 if (ocrKw.length) {
-                    DYLog(@"captured 口令 via OCR: '%@'", ocrKw);
-                    [strongSelf fillAndSend:ocrKw
+                    // A super-bag comment captured earlier from the card wins over
+                    // whatever OCR re-derives here.
+                    NSString *toSend = (strongSelf.superBagComment.length > 0)
+                                       ? strongSelf.superBagComment : ocrKw;
+                    DYLog(@"captured comment via OCR: '%@' (superBag active=%d)", ocrKw, strongSelf.superBagActive);
+                    [strongSelf fillAndSend:toSend
                                       input:liveInput
                                    prefill:[strongSelf textOfInput:liveInput.view]
                                    attempt:attempt];
                 } else {
                     [strongSelf dumpCommentSheet];
-                    [strongSelf updateStatus:@"未捕获口令，无法发评论"];
+                    [strongSelf updateStatus:@"未捕获口令/评论，无法发评论"];
                 }
                 } @catch (NSException *exception) {
                     DYLog(@"attemptCommentSend OCR: caught exception (%@): %@",
@@ -595,6 +637,78 @@ static const NSInteger kCommentMaxAttempts = 4;
     return nil;
 }
 
+/// Extracts the fixed comment a 超级福袋 prints on its card, e.g.
+/// "发送评论：华为暑促季，用"新"享一夏" -> "华为暑促季，用"新"享一夏". Returns nil
+/// if `text` does not contain a 发送评论 / 评论： marker.
+- (NSString *)specifiedCommentFromText:(NSString *)text {
+    if (text.length == 0) {
+        return nil;
+    }
+    NSArray<NSString *> *markers = @[ @"发送评论：", @"发送评论:", @"评论：", @"评论:" ];
+    for (NSString *marker in markers) {
+        NSRange r = [text rangeOfString:marker];
+        if (r.location != NSNotFound) {
+            NSString *tail = [text substringFromIndex:NSMaxRange(r)];
+            tail = [tail stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            // Super-bag comments can be long (may include quoted phrases like "新").
+            if (tail.length > 0 && tail.length <= 60) {
+                return tail;
+            }
+        }
+    }
+    return nil;
+}
+
+/// Captures a 超级福袋's fixed comment from the OCR hits (the card text).
+- (NSString *)captureSpecifiedCommentFromHits:(NSArray<DYTextHit *> *)hits {
+    if (![DYConfig shared].commentKeywordAutoSend) {
+        return nil;
+    }
+    for (DYTextHit *h in hits) {
+        NSString *c = [self specifiedCommentFromText:h.text];
+        if (c.length) {
+            return c;
+        }
+    }
+    return nil;
+}
+
+/// Captures a 超级福袋's fixed comment from the live view tree (revealed once the
+/// 参与 sheet is open). Returns nil if no 发送评论 marker is currently visible.
+- (NSString *)captureSpecifiedCommentFromSheet {
+    NSArray<DYViewHit *> *hits =
+        [DYViewDetector findViewsWithTextContaining:@[ kWordSendComment, @"评论：" ]];
+    for (DYViewHit *hit in hits) {
+        NSString *c = [self specifiedCommentFromText:hit.text];
+        if (c.length) {
+            return c;
+        }
+    }
+    return nil;
+}
+
+/// Resolves the comment to post from OCR hits: a 口令 first, otherwise (for a
+/// 超级福袋) the card-specified comment. Used by the OCR fallback inside the comment
+/// flow when the view tree + prefill found nothing.
+- (NSString *)resolveCommentFromHits:(NSArray<DYTextHit *> *)hits {
+    for (DYTextHit *h in hits) {
+        if ([h.text rangeOfString:kWordKeyword].location != NSNotFound) {
+            NSString *kw = [self keywordFromText:h.text];
+            if (kw.length) {
+                return kw;
+            }
+        }
+    }
+    for (DYTextHit *h in hits) {
+        NSString *c = [self specifiedCommentFromText:h.text];
+        if (c.length) {
+            return c;
+        }
+    }
+    return nil;
+}
+
 /// Current editable text of an input field (to detect a Douyin-prefilled 口令).
 - (NSString *)textOfInput:(UIView *)view {
     if ([view isKindOfClass:UITextField.class]) {
@@ -665,7 +779,32 @@ static const NSInteger kCommentMaxAttempts = 4;
     if (![DYConfig shared].autoFollowForBags) {
         return;
     }
-    DYViewHit *gate = [DYViewDetector firstControlWithTextContainingAny:@[ @"关注", @"加入粉丝团", @"加入团", @"立即加入" ]];
+    // A 超级福袋 needs the *shopping* fan-club join (加入购物粉丝团), which is a
+    // different control from the broadcaster's 关注 button. When a super bag is on
+    // screen, prefer the fan-club gate so we don't tap the wrong one. Detect it
+    // live from the view tree each call, because the card (and thus the marker)
+    // may only be visible after 参与 opened the sheet.
+    BOOL superBag = [DYViewDetector firstViewWithTextContaining:kWordSuperBag] != nil
+                 || [DYViewDetector firstViewWithTextContaining:kWordSendComment] != nil
+                 || [DYViewDetector firstViewWithTextContaining:@"购物粉丝团"] != nil
+                 || [DYViewDetector firstViewWithTextContaining:kWordFanClubTask] != nil;
+    NSArray<NSString *> *primary;
+    NSArray<NSString *> *secondary;
+    if (superBag) {
+        // 购物粉丝团 / 粉丝团 first; only fall back to 关注 if no fan-club control.
+        // "粉丝团" subsumes both "加入粉丝团" and "加入购物粉丝团" (the "购物" in
+        // the middle breaks the "加入粉丝团" substring, so a bare "粉丝团" match is
+        // what actually catches the shopping fan club).
+        primary   = @[ @"购物粉丝团", @"粉丝团" ];
+        secondary = @[ @"关注", @"立即加入" ];
+    } else {
+        primary   = @[ @"关注", @"加入粉丝团", @"加入团", @"立即加入" ];
+        secondary = @[ @"粉丝团" ];
+    }
+    DYViewHit *gate = [DYViewDetector firstControlWithTextContainingAny:primary];
+    if (!gate) {
+        gate = [DYViewDetector firstControlWithTextContainingAny:secondary];
+    }
     if (!gate) {
         return;
     }
@@ -675,7 +814,7 @@ static const NSInteger kCommentMaxAttempts = 4;
         // "已加入粉丝团") — nothing to tap, and re-tapping would be wrong.
         return;
     }
-    DYLog(@"follow gate: tapping '%@'", gate.text);
+    DYLog(@"follow gate: tapping '%@'%@", gate.text, superBag ? @" (super bag)" : @"");
     [[DYTouch shared] tapView:gate.view];
 }
 

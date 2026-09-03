@@ -42,6 +42,14 @@ void DYCrashLogWriteLine(const char *line);
 typedef int (*DYCrashLogPreHandler)(int sig);
 void DYCrashLogSetPreHandler(DYCrashLogPreHandler handler);
 
+// Re-installs DYCrashLog's signal handler as the LAST disposition for the fault
+// signals, chaining whatever handler was there before (another tweak / the app's
+// own reporter). Call this immediately before a vulnerable operation (e.g. a view
+// tree walk): on a jailbroken device several parties fight over SIGSEGV/SIGBUS and
+// whoever installed LAST wins, so re-taking right before we need it defeats that
+// displacement and makes the recovery pre-handler reachable regardless of order.
+void DYCrashLogRetakeSignals(void);
+
 #ifdef __cplusplus
 }
 #endif

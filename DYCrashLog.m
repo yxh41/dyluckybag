@@ -30,6 +30,22 @@ void DYCrashLogSetPreHandler(DYCrashLogPreHandler handler) {
     gPreHandler = handler;
 }
 
+void DYCrashLogRetakeSignals(void) {
+    if (!gInstalled) return;
+    int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+    for (size_t i = 0; i < sizeof(signals) / sizeof(int); i++) {
+        int sig = signals[i];
+        if (sig >= 0 && sig < 32) {
+            // Re-install our handler as the LAST one, chaining whoever was there.
+            // This defeats displacement: right before a vulnerable tree walk we own
+            // the signal, so our recovery pre-handler gets consulted no matter who
+            // installed last.
+            void (*prev)(int) = signal(sig, DYSignalHandler);
+            gPrevSig[sig] = prev;
+        }
+    }
+}
+
 static void DYWriteRaw(const char *data, size_t len) {
     if (gCrashPath[0] == '\0' || len == 0) return;
     int fd = open(gCrashPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
