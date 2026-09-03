@@ -140,13 +140,22 @@ static const NSInteger kQuietThreshold = 10;
     __weak typeof(self) weakSelf = self;
     [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        strongSelf.scanning = NO;
-        if (error) {
-            [strongSelf updateStatus:[NSString stringWithFormat:@"OCR 失败: %@",
-                                      error.localizedDescription]];
-            return;
+        // This completion runs on a LATER call stack (OCR dispatches its result to
+        // the main queue), so it is OUTSIDE the @try of any caller. Guard it
+        // directly so an exception cannot escape and crash Douyin.
+        @try {
+            strongSelf.scanning = NO;
+            if (error) {
+                [strongSelf updateStatus:[NSString stringWithFormat:@"OCR 失败: %@",
+                                          error.localizedDescription]];
+                return;
+            }
+            [strongSelf handleHits:hits];
+        } @catch (NSException *exception) {
+            DYLog(@"scanOnce completion: caught exception (%@): %@",
+                  exception.name, exception.reason);
+            strongSelf.scanning = NO;
         }
-        [strongSelf handleHits:hits];
     }];
 }
 
@@ -252,8 +261,16 @@ static const NSInteger kQuietThreshold = 10;
     // 8. Tap it — through the real view when we have one, else by coordinate.
     BOOL dispatched;
     if (joinTargetView) {
-        DYLog(@"tapping join (view-tree) '%@' at %@", joinLabel, NSStringFromCGPoint(center));
-        dispatched = [[DYTouch shared] tapView:joinTargetView];
+        // The join view came from a view-tree scan; if Douyin has already torn it
+        // down (sheet dismissed / row scrolled away) tapping it faults on a stale
+        // control. Skip honestly instead of touching a dead view.
+        if (joinTargetView.window == nil) {
+            DYLog(@"join view no longer on screen — skipping tap");
+            dispatched = NO;
+        } else {
+            DYLog(@"tapping join (view-tree) '%@' at %@", joinLabel, NSStringFromCGPoint(center));
+            dispatched = [[DYTouch shared] tapView:joinTargetView];
+        }
     } else {
         DYLog(@"tapping join (ocr-rect) '%@' at %@", joinLabel, NSStringFromCGPoint(center));
         dispatched = [[DYTouch shared] tapInRect:CGRectMake(center.x - 1.0, center.y - 1.0, 2.0, 2.0)];
@@ -315,12 +332,16 @@ static const NSInteger kQuietThreshold = 10;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // The whole block runs on a later call stack, outside any caller's @try.
+        // Guard it so a verify failure can never crash the host.
+        @try {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf || !strongSelf.running) {
             return;
         }
 
         [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
+            @try {
             if (error || hits.count == 0) {
                 DYLog(@"tap verify: inconclusive (no OCR result)");
                 return;
@@ -343,7 +364,15 @@ static const NSInteger kQuietThreshold = 10;
                 }
             }
             DYLog(@"tap verify: OK - join button gone from the tapped spot");
+            } @catch (NSException *exception) {
+                DYLog(@"verifyTapAtPoint OCR: caught exception (%@): %@",
+                      exception.name, exception.reason);
+            }
         }];
+        } @catch (NSException *exception) {
+            DYLog(@"verifyTapAtPoint: caught exception (%@): %@",
+                  exception.name, exception.reason);
+        }
     });
 }
 
@@ -416,6 +445,18 @@ static const NSInteger kQuietThreshold = 10;
             // Douyin sometimes renders the 口令 as an image, which the view tree
             // cannot read but Vision can. If OCR also fails, dump and bail.
             [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
+                @try {
+                // This completion runs on a LATER call stack than the @try that
+                // wrapped the dispatch to OCR, so it is NOT under that guard.
+                // Guard it here. Also re-resolve the live input field: the sheet
+                // may have changed while OCR ran, and acting on the captured
+                // (possibly torn-down) input.view can fault with EXC_BAD_ACCESS.
+                DYViewHit *liveInput = [DYViewDetector firstInputField];
+                if (!liveInput) {
+                    DYLog(@"comment send: input gone during OCR — cannot post 口令");
+                    [strongSelf updateStatus:@"评论框已消失，参与未完成"];
+                    return;
+                }
                 NSString *ocrKw = nil;
                 for (DYTextHit *h in hits) {
                     if ([h.text rangeOfString:kWordKeyword].location != NSNotFound) {
@@ -425,10 +466,18 @@ static const NSInteger kQuietThreshold = 10;
                 }
                 if (ocrKw.length) {
                     DYLog(@"captured 口令 via OCR: '%@'", ocrKw);
-                    [strongSelf fillAndSend:ocrKw input:input prefill:prefill attempt:attempt];
+                    [strongSelf fillAndSend:ocrKw
+                                      input:liveInput
+                                   prefill:[strongSelf textOfInput:liveInput.view]
+                                   attempt:attempt];
                 } else {
                     [strongSelf dumpCommentSheet];
                     [strongSelf updateStatus:@"未捕获口令，无法发评论"];
+                }
+                } @catch (NSException *exception) {
+                    DYLog(@"attemptCommentSend OCR: caught exception (%@): %@",
+                          exception.name, exception.reason);
+                    [strongSelf updateStatus:@"评论发送异常，已跳过"];
                 }
             }];
             return;   // wait for OCR completion before deciding
