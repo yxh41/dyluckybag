@@ -30,7 +30,8 @@ DYLuckyBag_FILES = \
 	DYTouch.m \
 	DYEngine.m \
 	DYPanel.m \
-	DYLog.m
+	DYLog.m \
+	DYCrashLog.m
 
 # DYLog() compiles to ((void)0) in release builds, so any variable that exists
 # only to feed a log line becomes "unused" and -Werror would fail the release
