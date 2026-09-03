@@ -30,6 +30,9 @@ DEFAULT_TARGETS = [
     "attemptCommentSend",
     "verifyCommentSent",
     "handleHits",
+    # crash-diagnostic module markers
+    "DYCrashLog installed",
+    "EXC_BAD_ACCESS",
 ]
 
 

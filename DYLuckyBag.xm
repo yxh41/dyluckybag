@@ -2,6 +2,7 @@
 #import "DYEngine.h"
 #import "DYPanel.h"
 #import "DYLog.h"
+#import "DYCrashLog.h"
 #import <UIKit/UIKit.h>
 
 // This file deliberately contains NO %hook blocks.
@@ -24,6 +25,11 @@ static void DYStartServices(void) {
 }
 
 %ctor {
+    // Install crash diagnostics before anything else: a signal handler catches
+    // the low-level fault class (@try/@catch cannot) and records a breadcrumb to
+    // dyluckybag_crash.log so we no longer depend on digging up the system report.
+    DYCrashLogInstall();
+
     DYLog(@"tweak loaded into %@ (v%@)", NSBundle.mainBundle.bundleIdentifier,
           [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
 
