@@ -109,8 +109,8 @@ static void DYSignalHandler(int sig) {
 
 static void DYUncaughtHandler(NSException *exception) {
     DYWriteBanner("NSException");
-    DYWriteLine([@[exception name] UTF8String] ?: "?");
-    DYWriteLine([@[exception reason] UTF8String] ?: "?");
+    DYWriteLine([[exception name] UTF8String] ?: "?");
+    DYWriteLine([[exception reason] UTF8String] ?: "?");
     NSArray<NSString *> *syms = [exception callStackSymbols];
     if (syms.count) {
         DYWriteLine("call stack:");
