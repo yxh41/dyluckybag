@@ -24,13 +24,13 @@
 static BOOL DYMemReadable(void *addr, size_t len) {
     if (!addr || len == 0) return NO;
     vm_address_t val = 0;
-    mach_msg_type_number_t out = 0;
+    vm_size_t out = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(),
                                          (vm_address_t)addr,
                                          (vm_size_t)len,
                                          (vm_address_t)&val,
                                          &out);
-    return (kr == KERN_SUCCESS && out == (mach_msg_type_number_t)len);
+    return (kr == KERN_SUCCESS && out == (vm_size_t)len);
 }
 
 static BOOL DYIsLiveObject(id p) {
@@ -44,7 +44,7 @@ static BOOL DYIsLiveObject(id p) {
     // subsequent isKindOfClass:/property reads won't dereference a bad isa.
     Class cls = object_getClass(p);
     if (cls == Nil) return NO;
-    if (!DYMemReadable((void *)cls, sizeof(uintptr_t))) return NO;
+    if (!DYMemReadable((__bridge void *)cls, sizeof(uintptr_t))) return NO;
     return YES;
 }
 
