@@ -23,6 +23,25 @@ void DYCrashLogInstall(void);
 // `line` must be a plain C string.
 void DYCrashLogWriteLine(const char *line);
 
+// Optional hook consulted at the very top of the signal handler, before any
+// breadcrumb is written. Return 1 to say "this fault was recovered from — do
+// not report it"; return 0 to let DYCrashLog report it as usual.
+//
+// Why this exists: on a jailbroken device several parties fight over SIGSEGV /
+// SIGBUS (the host app's own crash reporter, other tweaks). Whoever owns the
+// disposition at fault time is whoever installed LAST, so a guard that merely
+// calls sigaction() once can silently lose it — the 2026-09-03 12:02 report
+// logged verified=1 and still faulted into this handler. DYCrashLog's handler
+// is the one that ends up at the bottom of the chain on device (every report so
+// far shows it at frame 0), so hooking here is the reliable way to be consulted
+// no matter who currently owns the signal.
+//
+// Called from a signal handler: async-signal-safe only. Return 1 ONLY if you
+// have actually recovered by siglongjmp-ing away — returning 1 without
+// recovering would resume the faulting instruction forever.
+typedef int (*DYCrashLogPreHandler)(int sig);
+void DYCrashLogSetPreHandler(DYCrashLogPreHandler handler);
+
 #ifdef __cplusplus
 }
 #endif

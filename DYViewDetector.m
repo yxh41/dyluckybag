@@ -27,6 +27,15 @@
 // thread-local storage so nesting and other threads both behave, and every step
 // is written to the crash log so the next report says exactly what the guard did
 // and whether the kernel accepted it.
+//
+// v3 (2026-09-03): v2 proved the kernel DOES accept our handler (verified=1) and
+// still caught nothing, because the disposition is contested at runtime — the
+// captured chain target was an address outside our own dylib, and by fault time
+// DYCrashLog's handler was back in place. Three changes: (1) re-assert our
+// handler immediately before every walk instead of once; (2) hook DYCrashLog's
+// handler as a last-resort recovery point, since it sits at the bottom of the
+// chain and always gets consulted; (3) log whoever we find in our way so the
+// next report names the party we are fighting.
 
 typedef struct {
     int depth;        // >0 while this thread is inside a guarded walk
@@ -90,6 +99,22 @@ static void DYGuardHandler(int sig) {
     raise(sig);
 }
 
+// Last line of defence. Installed as DYCrashLog's pre-handler: when a third
+// party owns SIGSEGV at fault time our own handler never runs, but they chain
+// down to DYCrashLog (every report so far shows DYSignalHandler at frame 0), so
+// we still get asked. Returns 1 if we recovered — which in practice means we
+// siglongjmp'd away and never returned at all.
+static int DYGuardPreHandler(int sig) {
+    (void)sig;
+    DYWalkState *st = DYWalkStateNoAlloc();
+    if (st && st->depth > 0) {
+        st->depth = 0;
+        DYCrashLogWriteLine("guard: recovered via DYCrashLog hook — our own signal handler was not in place");
+        siglongjmp(st->jmp, 1);
+    }
+    return 0;
+}
+
 static void DYGuardInstall(void) {
     struct sigaction sa, check;
     memset(&sa, 0, sizeof(sa));
@@ -113,6 +138,56 @@ static void DYGuardInstall(void) {
     DYCrashLogWriteLine(line);
 
     gGuardInstalled = installed;
+
+    // Safety net: even if we lose the disposition, DYCrashLog's handler sits at
+    // the bottom of the chain on device and will consult us.
+    DYCrashLogSetPreHandler(DYGuardPreHandler);
+}
+
+// v3 (2026-09-03): v2 answered "did the kernel accept our handler?" (yes,
+// verified=1) but still caught nothing, because installing once is not enough —
+// the 12:02 report captured segv_prev=0x13a5e1d34, an address outside our own
+// dylib, proving the disposition is contested at runtime and gets taken back
+// after we install. So we re-take it immediately before every walk: whatever we
+// find in our way becomes the new chain target, so a genuine crash outside a
+// walk is still reported in full.
+#define DY_GUARD_MAX_ASSERT_LOGS 8
+static int gGuardAssertLogs = 0;
+
+static void DYGuardReassert(const char *when) {
+    for (int i = 0; i < 2; i++) {
+        int sig = (i == 0) ? SIGSEGV : SIGBUS;
+        struct sigaction *prev = (i == 0) ? &gPrevSeg : &gPrevBus;
+        struct sigaction cur;
+
+        memset(&cur, 0, sizeof(cur));
+        if (sigaction(sig, NULL, &cur) != 0) {
+            continue;                       // cannot query — leave it alone
+        }
+        if (cur.sa_handler == DYGuardHandler) {
+            continue;                       // still ours, nothing to do
+        }
+
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = DYGuardHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+
+        // Remember who we displaced so non-walk faults still chain to them.
+        *prev = cur;
+        sigaction(sig, &sa, NULL);
+
+        if (gGuardAssertLogs < DY_GUARD_MAX_ASSERT_LOGS) {
+            gGuardAssertLogs++;
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "guard: re-assert %s %s: found %p, retook signal (#%d)",
+                     when, (i == 0) ? "SIGSEGV" : "SIGBUS",
+                     (void *)cur.sa_handler, gGuardAssertLogs);
+            DYCrashLogWriteLine(line);
+        }
+    }
 }
 
 // Runs body(); returns NO if a fault aborted it, YES otherwise.
@@ -120,9 +195,16 @@ static BOOL DYGuardedWalk(void (^body)(void)) {
     if (!body) {
         return YES;
     }
-    // Lazy install: by the first walk the tweak %ctor has already run
-    // DYCrashLogInstall(), so gPrevSeg/gPrevBus are DYCrashLog's handler.
+    // Lazy install: running on the first walk (not in %ctor) means DYCrashLog
+    // is already installed, so gPrevSeg/gPrevBus start out as *somebody's*
+    // handler — on device that is not always DYCrashLog's, see DYGuardReassert.
     pthread_once(&gDYGuardInstallOnce, DYGuardInstall);
+
+    // Re-take the signal right before the dangerous code, every single time —
+    // installing once (v2) was not enough, see DYGuardReassert.
+    if (gGuardInstalled) {
+        DYGuardReassert("pre-walk");
+    }
 
     DYWalkState *st = DYWalkStateForCurrentThread();
     if (!st || !gGuardInstalled) {

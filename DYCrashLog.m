@@ -21,6 +21,14 @@ static int gInstalled = 0;
 // Saved previous dispositions so we can chain to whatever was there before us
 // (the app's own crash reporter, other tweaks) instead of swallowing their handler.
 static void (*gPrevSig[32])(int);
+// Set by whichever module wants a chance to recover from a fault before it is
+// reported. Plain function pointer: readable from a signal handler without
+// touching anything that allocates.
+static DYCrashLogPreHandler gPreHandler = NULL;
+
+void DYCrashLogSetPreHandler(DYCrashLogPreHandler handler) {
+    gPreHandler = handler;
+}
 
 static void DYWriteRaw(const char *data, size_t len) {
     if (gCrashPath[0] == '\0' || len == 0) return;
@@ -80,20 +88,30 @@ static const char *DYSignalName(int sig) {
 }
 
 static void DYSignalHandler(int sig) {
-    DYWriteBanner("signal");
-    char line[160];
-    snprintf(line, sizeof(line), "signal = %d (%s)  pid=%d",
-             sig, DYSignalName(sig), (int)getpid());
-    DYWriteLine(line);
-    DYWriteLine("Low-level fault class — @try/@catch cannot catch this (e.g. EXC_BAD_ACCESS"
-                " on a stale/torn-down view or a zombie delegate).");
-    DYWriteLine("The OS crash report for this process also holds the full native backtrace.");
+    // Give the recovery hook first refusal. If the fault happened inside code
+    // that armed a walk guard, the hook siglongjmps away and never returns; we
+    // must not write a breadcrumb for a crash that did not actually happen.
+    // If it returns 1 without recovering, fall through to the normal path
+    // rather than returning — resuming the faulting instruction would loop.
+    DYCrashLogPreHandler hook = gPreHandler;
+    int recovered = hook ? hook(sig) : 0;
+
+    if (!recovered) {
+        DYWriteBanner("signal");
+        char line[160];
+        snprintf(line, sizeof(line), "signal = %d (%s)  pid=%d",
+                 sig, DYSignalName(sig), (int)getpid());
+        DYWriteLine(line);
+        DYWriteLine("Low-level fault class — @try/@catch cannot catch this (e.g. EXC_BAD_ACCESS"
+                    " on a stale/torn-down view or a zombie delegate).");
+        DYWriteLine("The OS crash report for this process also holds the full native backtrace.");
 #ifdef DY_HAVE_BACKTRACE
-    void *frames[64];
-    int n = backtrace(frames, 64);
-    DYWriteBacktrace(frames, n);
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        DYWriteBacktrace(frames, n);
 #endif
-    DYWriteLine("=== end breadcrumb ===");
+        DYWriteLine("=== end breadcrumb ===");
+    }
 
     // Chain to whatever was installed before us (app reporter / other tweak),
     // otherwise restore the default disposition and re-raise so the OS still
