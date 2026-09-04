@@ -85,6 +85,13 @@ static const NSInteger kCommentMaxAttempts = 6;
 - (void)fillInput:(UIView *)view withText:(NSString *)text;
 - (void)handleFollowGate;
 - (void)verifyCommentSent;
+// 超级福袋 one-tap comment.
+- (void)tapOneClickCommentByOCR:(NSString *)keyword attempt:(NSInteger)attempt;
+- (void)finishOneClickComment;
+- (void)fillAndSend:(NSString *)comment
+              input:(DYViewHit *)input
+            prefill:(NSString *)prefill
+            attempt:(NSInteger)attempt;
 @end
 
 @implementation DYEngine
@@ -532,21 +539,15 @@ static const NSInteger kCommentMaxAttempts = 6;
                 DYLog(@"super bag: tapping '%@' (comment='%@')",
                       oneClick.text, strongSelf.superBagComment ?: @"(posted by Douyin)");
                 [[DYTouch shared] tapView:oneClick.view];
-                strongSelf.lastCommentWasOneClick = YES;
-                [[DYConfig shared] incrementJoinCount];
-                [[DYConfig shared] synchronize];
-                // NOTE: no square brackets around this ternary — [a ? b : c] would
-                // parse as a message send, not as grouping ("expected identifier").
-                NSString *status = strongSelf.superBagComment.length > 0
-                    ? [NSString stringWithFormat:@"超级福袋：已一键发表评论 %@",
-                                                 strongSelf.superBagComment]
-                    : @"超级福袋：已一键发表评论";
-                [strongSelf updateStatus:status];
-                [strongSelf verifyCommentSent];
+                [strongSelf finishOneClickComment];
                 return;
             }
-            DYLog(@"super bag: '%@' not found (comment='%@')",
-                  kWordOneClickComment, strongSelf.superBagComment);
+            // The view tree can miss it: Lynx may render the button as a bitmap,
+            // leaving no text node to match at all. OCR reads pixels, so it still
+            // sees it — the device log's [一键发表评论 @195,747] came from Vision,
+            // not from the view tree. Fall back to tapping the recognised rect.
+            [strongSelf tapOneClickCommentByOCR:keyword attempt:attempt];
+            return;
         }
         // --- end 超级福袋 one-tap comment ----------------------------------
 
@@ -715,6 +716,92 @@ static const NSInteger kCommentMaxAttempts = 6;
         [self updateStatus:@"评论发送异常，已跳过"];
         // An exception means the send did not complete — do not inflate the counter.
     }
+}
+
+/// OCR fallback for the 超级福袋 one-tap button. Lynx can render the button as a
+/// bitmap, in which case the view tree holds no text node to match and
+/// -firstViewWithTextContaining: finds nothing. OCR reads pixels, so it still
+/// sees it; tap the recognised rect.
+- (void)tapOneClickCommentByOCR:(NSString *)keyword attempt:(NSInteger)attempt {
+    __weak typeof(self) weakSelf = self;
+    [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
+        // This completion runs on a LATER call stack than the @try in
+        // -attemptCommentSend:, so it is NOT under that guard. Guard it here.
+        @try {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.running) {
+            return;
+        }
+        DYTextHit *btn = nil;
+        for (NSString *kw in @[ kWordOneClickComment, @"一键发送", @"一键评论" ]) {
+            btn = [hits dy_firstHitContaining:kw];
+            if (btn) {
+                break;
+            }
+        }
+        if (btn) {
+            DYLog(@"super bag: tapping '%@' via OCR at (%.0f,%.0f) (comment='%@')",
+                  btn.text, CGRectGetMidX(btn.rect), CGRectGetMidY(btn.rect),
+                  strongSelf.superBagComment ?: @"(posted by Douyin)");
+            [[DYTouch shared] tapInRect:btn.rect];
+            [strongSelf finishOneClickComment];
+            return;
+        }
+        if (error) {
+            DYLog(@"super bag: OCR failed for the one-tap button (%@)",
+                  error.localizedDescription);
+        } else {
+            DYLog(@"super bag: '%@' in neither view tree nor OCR (attempt %ld)",
+                  kWordOneClickComment, (long)attempt);
+        }
+        // Not a one-tap bag after all — or the panel is still animating in. If a
+        // real comment box is on screen, hand off to the normal input flow so a
+        // mis-detected super bag does not silently lose its comment.
+        DYViewHit *input = [DYViewDetector firstInputField];
+        if (input) {
+            NSString *comment = strongSelf.superBagComment.length > 0
+                ? strongSelf.superBagComment
+                : keyword;
+            if (comment.length > 0) {
+                [strongSelf fillAndSend:comment input:input prefill:nil attempt:attempt];
+                return;
+            }
+        }
+        if (attempt < kCommentMaxAttempts) {
+            [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
+            return;
+        }
+        // Out of attempts and the one-tap button never appeared. This block owns
+        // the super-bag flow (it returns in every branch above), so the degrade at
+        // the bottom of -attemptCommentSend: is unreachable for a super bag —
+        // report it here instead of ending silently.
+        DYLog(@"comment flow: 超级福袋 - neither 一键发表评论 nor a comment box "
+              @"appeared after %ld attempts — joined WITHOUT the comment",
+              (long)kCommentMaxAttempts);
+        [[DYConfig shared] incrementJoinCount];
+        [[DYConfig shared] synchronize];
+        [strongSelf updateStatus:@"已参与（超级福袋评论未发出）"];
+        [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
+        } @catch (NSException *exception) {
+            DYLog(@"tapOneClickCommentByOCR: caught exception (%@): %@",
+                  exception.name, exception.reason);
+        }
+    }];
+}
+
+/// Shared tail for both one-tap paths (view-tree tap and OCR tap): count the
+/// join, report, and verify. The caller has already logged where it tapped.
+- (void)finishOneClickComment {
+    self.lastCommentWasOneClick = YES;
+    [[DYConfig shared] incrementJoinCount];
+    [[DYConfig shared] synchronize];
+    // NOTE: no square brackets around this ternary — [a ? b : c] would parse as a
+    // message send, not as grouping ("expected identifier").
+    NSString *status = self.superBagComment.length > 0
+        ? [NSString stringWithFormat:@"超级福袋：已一键发表评论 %@", self.superBagComment]
+        : @"超级福袋：已一键发表评论";
+    [self updateStatus:status];
+    [self verifyCommentSent];
 }
 
 /// Re-scans the live view tree for the 口令, in case it is only revealed after
@@ -948,14 +1035,39 @@ static const NSInteger kCommentMaxAttempts = 6;
             // would report "still present" even on success. For this path, success
             // = 「一键发表评论」 is gone (the task row flips to (1/1)).
             strongSelf.lastCommentWasOneClick = NO;
-            DYViewHit *oneClick = [DYViewDetector
-                                   firstViewWithTextContaining:kWordOneClickComment];
-            if (!oneClick) {
-                DYLog(@"comment verify: OK - 一键发表评论 gone (super bag comment posted)");
-            } else {
+            DYViewHit *inTree = [DYViewDetector
+                                 firstViewWithTextContaining:kWordOneClickComment];
+            if (inTree) {
                 DYLog(@"comment verify: 一键发表评论 still present - send may not have landed");
                 [strongSelf updateStatus:@"超级福袋评论可能未发出"];
+                return;
             }
+            // Lynx can render the button as a bitmap, in which case the view tree
+            // never had a node for it — "absent from the tree" would then be a
+            // false success. Confirm with OCR before declaring victory.
+            [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits,
+                                                           NSError *err) {
+                // Later call stack than the @try above — guard it here.
+                @try {
+                if (!strongSelf.running) {
+                    return;
+                }
+                DYTextHit *ocr = [hits dy_firstHitContaining:kWordOneClickComment];
+                if (ocr) {
+                    DYLog(@"comment verify: 一键发表评论 still on screen per OCR - "
+                          @"send may not have landed");
+                    [strongSelf updateStatus:@"超级福袋评论可能未发出"];
+                } else if (err) {
+                    DYLog(@"comment verify: inconclusive - OCR failed (%@)",
+                          err.localizedDescription);
+                } else {
+                    DYLog(@"comment verify: OK - 一键发表评论 gone (super bag comment posted)");
+                }
+                } @catch (NSException *exception) {
+                    DYLog(@"verifyCommentSent OCR: caught exception (%@): %@",
+                          exception.name, exception.reason);
+                }
+            }];
             return;
         }
         DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
