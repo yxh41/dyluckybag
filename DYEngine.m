@@ -26,6 +26,11 @@ static NSArray<NSString *> *const kWinPhrases = @[
 static NSString *const kWordSuperBag    = @"超级福袋";
 static NSString *const kWordSendComment = @"发送评论";
 static NSString *const kWordFanClubTask = @"福袋任务";
+// 超级福袋 puts a one-tap button on the bag panel that posts the card-specified
+// comment for you. There is NO comment input box on these panels, so a flow that
+// waits for -firstInputField will never find one and degrades to a plain join
+// (see dyluckybag(16).log: 6x "input not ready" -> "no comment box").
+static NSString *const kWordOneClickComment = @"一键发表评论";
 
 // A tap landing within this radius of the previous tap is treated as the same
 // button, so we do not hammer "join" on every scan pass.
@@ -57,6 +62,16 @@ static const NSInteger kCommentMaxAttempts = 6;
 @property (nonatomic) NSString *lastKeyword;
 @property (nonatomic, copy) NSString *superBagComment;   // fixed comment a 超级福袋 prints on its card
 @property (nonatomic) BOOL superBagActive;               // re-detected every scan; NOT cleared at end of handleHits
+// Follow-gate debounce: -attemptCommentSend: runs up to 6 passes and tapped the
+// SAME gate on every pass on device (7x '粉丝团' in a row), which kept popping the
+// 购物粉丝团 panel and covered the bag panel so 一键发表评论 disappeared.
+@property (nonatomic) CFTimeInterval lastGateTapTime;
+@property (nonatomic, copy) NSString *lastGateLabel;
+// Set when the comment was posted via a 超级福袋's 「一键发表评论」 button. The
+// post-send check must NOT then look for a generic 发送/发表/发布 control: that
+// very button contains 发表, so it would always look "still present" and report a
+// false failure.
+@property (nonatomic) BOOL lastCommentWasOneClick;
 @property (nonatomic) NSInteger quietPasses;
 @property (nonatomic) NSTimeInterval currentInterval;
 
@@ -425,6 +440,12 @@ static const NSInteger kCommentMaxAttempts = 6;
     // opens the comment sheet, so -attemptCommentSend: re-scans the sheet (and
     // checks for a Douyin-prefilled box) before deciding what to post.
     DYLog(@"comment flow: 参与 tapped, resolving 口令 from sheet (pre-tap='%@')", keyword);
+    // Fresh bag, fresh budget: the follow-gate debounce and the one-click flag
+    // are per-participation, so a previous bag's gate taps cannot suppress this
+    // one's (and a stale one-click flag cannot hijack this bag's verify).
+    self.lastGateLabel = nil;
+    self.lastGateTapTime = 0;
+    self.lastCommentWasOneClick = NO;
     [self attemptCommentSend:keyword attempt:0];
 }
 
@@ -461,6 +482,53 @@ static const NSInteger kCommentMaxAttempts = 6;
             [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
             return;
         }
+
+        // --- 超级福袋 fast path: one-tap comment ---------------------------
+        // A 超级福袋 has NO comment input box. Douyin shows the fixed comment on
+        // the card ("发送评论：<text>") and offers a single button, 「一键发表评论」,
+        // which posts it for you. Waiting for -firstInputField therefore never
+        // succeeds and the flow used to burn all 6 attempts and degrade to a plain
+        // join. Try the one-tap button FIRST, before any gate or input-box work.
+        if (strongSelf.superBagComment.length == 0) {
+            NSString *c = [strongSelf captureSpecifiedCommentFromSheet];
+            if (c.length > 0) {
+                strongSelf.superBagComment = c;
+                DYLog(@"super bag: captured specified comment from sheet '%@'", c);
+            }
+        }
+        if (strongSelf.superBagActive || strongSelf.superBagComment.length > 0) {
+            // Match ANY view with this text, not just UIControl: Douyin renders
+            // many live-room controls with Lynx (the join button logs as
+            // LynxTextView), and those are not UIControl subclasses, so
+            // -firstControlWithTextContainingAny: would find nothing. DYTouch
+            // falls back to a coordinate tap for non-controls ("no direct target;
+            // point-tap fallback"), which is what tapping 参与 already relies on.
+            DYViewHit *oneClick = nil;
+            for (NSString *kw in @[ kWordOneClickComment, @"一键发送", @"一键评论" ]) {
+                oneClick = [DYViewDetector firstViewWithTextContaining:kw];
+                if (oneClick) {
+                    break;
+                }
+            }
+            if (oneClick) {
+                // Tapping this posts the card-specified comment; no need to know
+                // the text ourselves (we log it only when we captured it).
+                DYLog(@"super bag: tapping '%@' (comment='%@')",
+                      oneClick.text, strongSelf.superBagComment ?: @"(posted by Douyin)");
+                [[DYTouch shared] tapView:oneClick.view];
+                strongSelf.lastCommentWasOneClick = YES;
+                [[DYConfig shared] incrementJoinCount];
+                [[DYConfig shared] synchronize];
+                [strongSelf updateStatus:[strongSelf.superBagComment.length > 0
+                                          ? [NSString stringWithFormat:@"超级福袋：已一键发表评论 %@", strongSelf.superBagComment]
+                                          : @"超级福袋：已一键发表评论"]];
+                [strongSelf verifyCommentSent];
+                return;
+            }
+            DYLog(@"super bag: '%@' not found (comment='%@')",
+                  kWordOneClickComment, strongSelf.superBagComment);
+        }
+        // --- end 超级福袋 fast path ----------------------------------------
 
         // No blocking dialog — tap any follow / fan-club gate that isn't already
         // resolved. The user must have autoFollowForBags on; otherwise this is a
@@ -791,12 +859,17 @@ static const NSInteger kCommentMaxAttempts = 6;
     NSArray<NSString *> *primary;
     NSArray<NSString *> *secondary;
     if (superBag) {
-        // 购物粉丝团 / 粉丝团 first; only fall back to 关注 if no fan-club control.
-        // "粉丝团" subsumes both "加入粉丝团" and "加入购物粉丝团" (the "购物" in
-        // the middle breaks the "加入粉丝团" substring, so a bare "粉丝团" match is
-        // what actually catches the shopping fan club).
+        // 购物粉丝团 / 粉丝团 first. "粉丝团" subsumes both "加入粉丝团" and
+        // "加入购物粉丝团" (the "购物" in the middle breaks the "加入粉丝团"
+        // substring, so a bare "粉丝团" match is what actually catches the
+        // shopping fan club).
+        //
+        // 关注 is deliberately REMOVED from the super-bag secondary list: on
+        // device it matched the BROADCASTER's follow button up in the room header
+        // ("关注 关注" at y≈69), which is not a bag task at all — tapping it did
+        // nothing for the bag and burned a pass.
         primary   = @[ @"购物粉丝团", @"粉丝团" ];
-        secondary = @[ @"关注", @"立即加入" ];
+        secondary = @[ @"立即加入" ];
     } else {
         primary   = @[ @"关注", @"加入粉丝团", @"加入团", @"立即加入" ];
         secondary = @[ @"粉丝团" ];
@@ -814,8 +887,24 @@ static const NSInteger kCommentMaxAttempts = 6;
         // "已加入粉丝团") — nothing to tap, and re-tapping would be wrong.
         return;
     }
+    // Debounce: -attemptCommentSend: runs up to 6 passes, and on device it tapped
+    // the SAME gate every pass (7x '粉丝团'), endlessly re-popping the 购物粉丝团
+    // panel — which covered the bag panel and made 一键发表评论 disappear, so the
+    // comment could never be posted. One tap per gate per window.
+    // 8s > one full retry cycle (6 attempts x 0.8s = 4.8s), so a gate is tapped
+    // at most once per bag participation instead of once per pass.
+    CFTimeInterval now = CACurrentMediaTime();
+    if (self.lastGateLabel.length > 0 &&
+        [label isEqualToString:self.lastGateLabel] &&
+        (now - self.lastGateTapTime) < 8.0) {
+        DYLog(@"follow gate: '%@' already tapped %.1fs ago — skipping",
+              label, now - self.lastGateTapTime);
+        return;
+    }
     DYLog(@"follow gate: tapping '%@'%@", gate.text, superBag ? @" (super bag)" : @"");
     [[DYTouch shared] tapView:gate.view];
+    self.lastGateLabel = label;
+    self.lastGateTapTime = now;
 }
 
 /// Light post-send check: the 发送 button should be gone once the comment posts.
@@ -828,6 +917,21 @@ static const NSInteger kCommentMaxAttempts = 6;
             return;
         }
         @try {
+        if (strongSelf.lastCommentWasOneClick) {
+            // A 超级福袋's own button contains 发表, so the generic check below
+            // would report "still present" even on success. For this path, success
+            // = 「一键发表评论」 is gone (the task row flips to (1/1)).
+            strongSelf.lastCommentWasOneClick = NO;
+            DYViewHit *oneClick = [DYViewDetector
+                                   firstViewWithTextContaining:kWordOneClickComment];
+            if (!oneClick) {
+                DYLog(@"comment verify: OK - 一键发表评论 gone (super bag comment posted)");
+            } else {
+                DYLog(@"comment verify: 一键发表评论 still present - send may not have landed");
+                [strongSelf updateStatus:@"超级福袋评论可能未发出"];
+            }
+            return;
+        }
         DYViewHit *send = [DYViewDetector firstControlWithTextContainingAny:@[ @"发送", @"发表", @"发布" ]];
         if (!send) {
             DYLog(@"comment verify: OK - 发送 button gone (comment posted)");
