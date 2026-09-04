@@ -519,9 +519,13 @@ static const NSInteger kCommentMaxAttempts = 6;
                 strongSelf.lastCommentWasOneClick = YES;
                 [[DYConfig shared] incrementJoinCount];
                 [[DYConfig shared] synchronize];
-                [strongSelf updateStatus:[strongSelf.superBagComment.length > 0
-                                          ? [NSString stringWithFormat:@"超级福袋：已一键发表评论 %@", strongSelf.superBagComment]
-                                          : @"超级福袋：已一键发表评论"]];
+                // NOTE: no square brackets around this ternary — [a ? b : c] would
+                // parse as a message send, not as grouping ("expected identifier").
+                NSString *status = strongSelf.superBagComment.length > 0
+                    ? [NSString stringWithFormat:@"超级福袋：已一键发表评论 %@",
+                                                 strongSelf.superBagComment]
+                    : @"超级福袋：已一键发表评论";
+                [strongSelf updateStatus:status];
                 [strongSelf verifyCommentSent];
                 return;
             }
