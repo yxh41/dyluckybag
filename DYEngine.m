@@ -483,12 +483,10 @@ static const NSInteger kCommentMaxAttempts = 6;
             return;
         }
 
-        // --- 超级福袋 fast path: one-tap comment ---------------------------
-        // A 超级福袋 has NO comment input box. Douyin shows the fixed comment on
-        // the card ("发送评论：<text>") and offers a single button, 「一键发表评论」,
-        // which posts it for you. Waiting for -firstInputField therefore never
-        // succeeds and the flow used to burn all 6 attempts and degrade to a plain
-        // join. Try the one-tap button FIRST, before any gate or input-box work.
+        // --- 超级福袋: capture the card-specified comment -------------------
+        // A 超级福袋 prints the fixed comment on the card ("发送评论：<text>")
+        // instead of asking for one. Capture it whenever we see it, so the
+        // one-tap path below can log what is about to be posted.
         if (strongSelf.superBagComment.length == 0) {
             NSString *c = [strongSelf captureSpecifiedCommentFromSheet];
             if (c.length > 0) {
@@ -496,6 +494,24 @@ static const NSInteger kCommentMaxAttempts = 6;
                 DYLog(@"super bag: captured specified comment from sheet '%@'", c);
             }
         }
+
+        // No blocking dialog — tap any follow / fan-club gate that isn't already
+        // resolved. The user must have autoFollowForBags on; otherwise this is a
+        // no-op and a gated bag will simply fail to comment (reported honestly).
+        //
+        // GATE FIRST, then the one-tap comment: a 超级福袋 can require the
+        // shopping fan-club join BEFORE 「一键发表评论」 does anything. Tapping that
+        // button first would no-op and return, leaving the gate permanently
+        // untapped — i.e. the same "comment never posted" bug all over again.
+        // The gate tap is debounced (once per label per participation), so it
+        // cannot re-pop the fan-club panel over the bag panel as it used to.
+        [strongSelf handleFollowGate];
+
+        // --- 超级福袋: one-tap comment -------------------------------------
+        // A 超级福袋 has NO comment input box. Douyin shows the fixed comment on
+        // the card and offers a single button, 「一键发表评论」, which posts it for
+        // you. Waiting on -firstInputField never succeeds and the flow used to
+        // burn all 6 attempts and degrade to a plain join.
         if (strongSelf.superBagActive || strongSelf.superBagComment.length > 0) {
             // Match ANY view with this text, not just UIControl: Douyin renders
             // many live-room controls with Lynx (the join button logs as
@@ -532,12 +548,7 @@ static const NSInteger kCommentMaxAttempts = 6;
             DYLog(@"super bag: '%@' not found (comment='%@')",
                   kWordOneClickComment, strongSelf.superBagComment);
         }
-        // --- end 超级福袋 fast path ----------------------------------------
-
-        // No blocking dialog — tap any follow / fan-club gate that isn't already
-        // resolved. The user must have autoFollowForBags on; otherwise this is a
-        // no-op and a gated bag will simply fail to comment (reported honestly).
-        [strongSelf handleFollowGate];
+        // --- end 超级福袋 one-tap comment ----------------------------------
 
         // Resolve what to post. Priority:
         //   1. super-bag specified comment (captured from card/sheet) — wins for 超级福袋
@@ -569,10 +580,21 @@ static const NSInteger kCommentMaxAttempts = 6;
                 return;
             }
             // Genuinely no comment box: treat as a plain join (参与 already joined).
-            DYLog(@"comment flow: no comment box — plain bag, counting join");
-            [[DYConfig shared] incrementJoinCount];
-            [[DYConfig shared] synchronize];
-            [strongSelf updateStatus:@"已参与（无评论框）"];
+            // For a 超级福袋 this is NOT the expected outcome — the one-tap button
+            // above should have posted. Say so, so the log is not read as success.
+            if (strongSelf.superBagActive || strongSelf.superBagComment.length > 0) {
+                DYLog(@"comment flow: 超级福袋 - neither 一键发表评论 nor a comment "
+                      @"box appeared after %ld attempts — joined WITHOUT the comment",
+                      (long)kCommentMaxAttempts);
+                [[DYConfig shared] incrementJoinCount];
+                [[DYConfig shared] synchronize];
+                [strongSelf updateStatus:@"已参与（超级福袋评论未发出）"];
+            } else {
+                DYLog(@"comment flow: no comment box — plain bag, counting join");
+                [[DYConfig shared] incrementJoinCount];
+                [[DYConfig shared] synchronize];
+                [strongSelf updateStatus:@"已参与（无评论框）"];
+            }
             [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
             return;   // real join — count it
         }
