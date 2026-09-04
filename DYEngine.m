@@ -86,7 +86,6 @@ static const NSInteger kCommentMaxAttempts = 6;
 - (void)handleFollowGate;
 - (void)verifyCommentSent;
 // 超级福袋 one-tap comment.
-- (void)tapOneClickCommentByOCR:(NSString *)keyword attempt:(NSInteger)attempt;
 - (void)finishOneClickComment;
 - (void)fillAndSend:(NSString *)comment
               input:(DYViewHit *)input
@@ -514,18 +513,23 @@ static const NSInteger kCommentMaxAttempts = 6;
         // cannot re-pop the fan-club panel over the bag panel as it used to.
         [strongSelf handleFollowGate];
 
-        // --- 超级福袋: one-tap comment -------------------------------------
-        // A 超级福袋 has NO comment input box. Douyin shows the fixed comment on
-        // the card and offers a single button, 「一键发表评论」, which posts it for
-        // you. Waiting on -firstInputField never succeeds and the flow used to
-        // burn all 6 attempts and degrade to a plain join.
+        // --- 超级福袋: one-tap comment (view tree only) --------------------
+        // A 超级福袋 is identified by its 「一键发表评论」 button. Plain 评论福袋
+        // ALSO show 发送评论： but have NO such button — they must type the
+        // comment into a box (the input flow below). So ONLY one-tap when the
+        // button is actually present in the view tree; if it is not, FALL THROUGH
+        // to the input flow so superBagComment is typed and posted there. That is
+        // what makes 普通 评论福袋 work, and is a safe fallback for a 超级福袋 whose
+        // one-tap button is delayed, off-screen, or rendered as a Lynx bitmap the
+        // view tree cannot see. (Build #53 returned from this block on ANY 发送评论：
+        // match, which swallowed plain 评论福袋 and never posted their comment — see
+        // dyluckybag(17).log: every attempt logged "...in neither view tree nor OCR"
+        // and ended "joined WITHOUT the comment".)
         if (strongSelf.superBagActive || strongSelf.superBagComment.length > 0) {
-            // Match ANY view with this text, not just UIControl: Douyin renders
-            // many live-room controls with Lynx (the join button logs as
-            // LynxTextView), and those are not UIControl subclasses, so
-            // -firstControlWithTextContainingAny: would find nothing. DYTouch
-            // falls back to a coordinate tap for non-controls ("no direct target;
-            // point-tap fallback"), which is what tapping 参与 already relies on.
+            // Match ANY view, not just UIControl: Lynx renders many live-room
+            // controls (the join button logs as LynxTextView), and those are not
+            // UIControl subclasses, so -firstControlWithTextContainingAny: would
+            // find nothing. DYTouch falls back to a coordinate tap for non-controls.
             DYViewHit *oneClick = nil;
             for (NSString *kw in @[ kWordOneClickComment, @"一键发送", @"一键评论" ]) {
                 oneClick = [DYViewDetector firstViewWithTextContaining:kw];
@@ -534,20 +538,17 @@ static const NSInteger kCommentMaxAttempts = 6;
                 }
             }
             if (oneClick) {
-                // Tapping this posts the card-specified comment; no need to know
-                // the text ourselves (we log it only when we captured it).
+                // Tapping this posts the card-specified comment for us.
                 DYLog(@"super bag: tapping '%@' (comment='%@')",
                       oneClick.text, strongSelf.superBagComment ?: @"(posted by Douyin)");
                 [[DYTouch shared] tapView:oneClick.view];
                 [strongSelf finishOneClickComment];
                 return;
             }
-            // The view tree can miss it: Lynx may render the button as a bitmap,
-            // leaving no text node to match at all. OCR reads pixels, so it still
-            // sees it — the device log's [一键发表评论 @195,747] came from Vision,
-            // not from the view tree. Fall back to tapping the recognised rect.
-            [strongSelf tapOneClickCommentByOCR:keyword attempt:attempt];
-            return;
+            // No one-tap button in the view tree — treat as a comment-box bag:
+            // do NOT return, let the input flow below type superBagComment + 发送.
+            DYLog(@"super bag: no 一键发表评论 in view tree — using comment-box flow "
+                  @"(comment='%@')", strongSelf.superBagComment);
         }
         // --- end 超级福袋 one-tap comment ----------------------------------
 
@@ -718,76 +719,6 @@ static const NSInteger kCommentMaxAttempts = 6;
     }
 }
 
-/// OCR fallback for the 超级福袋 one-tap button. Lynx can render the button as a
-/// bitmap, in which case the view tree holds no text node to match and
-/// -firstViewWithTextContaining: finds nothing. OCR reads pixels, so it still
-/// sees it; tap the recognised rect.
-- (void)tapOneClickCommentByOCR:(NSString *)keyword attempt:(NSInteger)attempt {
-    __weak typeof(self) weakSelf = self;
-    [[DYOCRDetector shared] detectWithCompletion:^(NSArray<DYTextHit *> *hits, NSError *error) {
-        // This completion runs on a LATER call stack than the @try in
-        // -attemptCommentSend:, so it is NOT under that guard. Guard it here.
-        @try {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.running) {
-            return;
-        }
-        DYTextHit *btn = nil;
-        for (NSString *kw in @[ kWordOneClickComment, @"一键发送", @"一键评论" ]) {
-            btn = [hits dy_firstHitContaining:kw];
-            if (btn) {
-                break;
-            }
-        }
-        if (btn) {
-            DYLog(@"super bag: tapping '%@' via OCR at (%.0f,%.0f) (comment='%@')",
-                  btn.text, CGRectGetMidX(btn.rect), CGRectGetMidY(btn.rect),
-                  strongSelf.superBagComment ?: @"(posted by Douyin)");
-            [[DYTouch shared] tapInRect:btn.rect];
-            [strongSelf finishOneClickComment];
-            return;
-        }
-        if (error) {
-            DYLog(@"super bag: OCR failed for the one-tap button (%@)",
-                  error.localizedDescription);
-        } else {
-            DYLog(@"super bag: '%@' in neither view tree nor OCR (attempt %ld)",
-                  kWordOneClickComment, (long)attempt);
-        }
-        // Not a one-tap bag after all — or the panel is still animating in. If a
-        // real comment box is on screen, hand off to the normal input flow so a
-        // mis-detected super bag does not silently lose its comment.
-        DYViewHit *input = [DYViewDetector firstInputField];
-        if (input) {
-            NSString *comment = strongSelf.superBagComment.length > 0
-                ? strongSelf.superBagComment
-                : keyword;
-            if (comment.length > 0) {
-                [strongSelf fillAndSend:comment input:input prefill:nil attempt:attempt];
-                return;
-            }
-        }
-        if (attempt < kCommentMaxAttempts) {
-            [strongSelf attemptCommentSend:keyword attempt:attempt + 1];
-            return;
-        }
-        // Out of attempts and the one-tap button never appeared. This block owns
-        // the super-bag flow (it returns in every branch above), so the degrade at
-        // the bottom of -attemptCommentSend: is unreachable for a super bag —
-        // report it here instead of ending silently.
-        DYLog(@"comment flow: 超级福袋 - neither 一键发表评论 nor a comment box "
-              @"appeared after %ld attempts — joined WITHOUT the comment",
-              (long)kCommentMaxAttempts);
-        [[DYConfig shared] incrementJoinCount];
-        [[DYConfig shared] synchronize];
-        [strongSelf updateStatus:@"已参与（超级福袋评论未发出）"];
-        [strongSelf verifyTapAtPoint:strongSelf.lastTapPoint];
-        } @catch (NSException *exception) {
-            DYLog(@"tapOneClickCommentByOCR: caught exception (%@): %@",
-                  exception.name, exception.reason);
-        }
-    }];
-}
 
 /// Shared tail for both one-tap paths (view-tree tap and OCR tap): count the
 /// join, report, and verify. The caller has already logged where it tapped.
@@ -965,10 +896,14 @@ static const NSInteger kCommentMaxAttempts = 6;
     // screen, prefer the fan-club gate so we don't tap the wrong one. Detect it
     // live from the view tree each call, because the card (and thus the marker)
     // may only be visible after 参与 opened the sheet.
-    BOOL superBag = [DYViewDetector firstViewWithTextContaining:kWordSuperBag] != nil
-                 || [DYViewDetector firstViewWithTextContaining:kWordSendComment] != nil
-                 || [DYViewDetector firstViewWithTextContaining:@"购物粉丝团"] != nil
-                 || [DYViewDetector firstViewWithTextContaining:kWordFanClubTask] != nil;
+    // Use the OCR+view-tree decision already made in -handleHits. A 超级福袋
+    // recognised only by Vision (viewTree=0 for its markers) would be misjudged
+    // as a plain bag here and we'd tap the broadcaster's header 关注 关注 instead
+    // of the bag's own fan-club gate — see dyluckybag(17).log:
+    // "follow gate: tapping '关注 关注'". self.superBagActive is re-detected every
+    // scan and stays NO for a plain 评论福袋 whose 发送评论： is OCR-only, so this
+    // does not regress plain bags (they still reach the 关注/加入粉丝团 branch).
+    BOOL superBag = self.superBagActive;
     NSArray<NSString *> *primary;
     NSArray<NSString *> *secondary;
     if (superBag) {
