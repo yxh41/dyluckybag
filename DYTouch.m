@@ -28,6 +28,9 @@
 - (BOOL)fireTapGestureAtPoint:(CGPoint)point;
 - (BOOL)tapView:(UIView *)view;
 - (BOOL)synthesizeTouchAtPoint:(CGPoint)point;
+- (UIView *)deepTappableInTree:(UIView *)root
+                   screenPoint:(CGPoint)screenPoint
+                        depth:(NSUInteger)depth;
 @end
 
 @implementation DYTouch
@@ -51,9 +54,11 @@
 }
 
 - (BOOL)tapAtPoint:(CGPoint)point {
-    // Three strategies, cheapest and most faithful first. Douyin mixes plain
-    // buttons with self-drawn views driven by gesture recognisers, and no single
-    // delivery mechanism covers both, so fall through until one lands.
+    // Four strategies, cheapest and most faithful first. Douyin mixes plain
+    // buttons with self-drawn views driven by gesture recognisers, and Lynx-
+    // rendered controls bury their real tap target inside a non-tappable outer
+    // container, so no single delivery mechanism covers all of them — fall
+    // through until one lands.
 
     // 1. A real UIControl with registered targets: just ask UIKit to fire it.
     UIControl *control = [self controlAtPoint:point];
@@ -79,7 +84,37 @@
         return YES;
     }
 
-    // 3. Last resort: push a real touch through the responder chain.
+    // 3. Lynx-rendered controls (`UILynxView` / `BDImageView` / outer `UIView`)
+    // bury their real tap target a few subviews down. hitTest returns the outer
+    // container, and the UP-walks above never find a control/gesture — so
+    // search the hit view's SUBTREE for a tappable at the same screen point.
+    UIWindow *window = [self frontWindow];
+    if (window) {
+        UIView *hitView = [window hitTest:[window convertPoint:point fromWindow:nil]
+                                withEvent:nil];
+        UIView *deep = hitView ? [self deepTappableInTree:hitView
+                                              screenPoint:point
+                                                   depth:0] : nil;
+        if (deep && deep.window != nil) {
+            DYLog(@"tap: deep tappable %@ under hit %@ at %@",
+                  NSStringFromClass(deep.class), NSStringFromClass(hitView.class),
+                  NSStringFromCGPoint(point));
+            if ([deep isKindOfClass:UIControl.class]) {
+                UIControl *c = (UIControl *)deep;
+                if (c.enabled && c.userInteractionEnabled && c.allTargets.count > 0) {
+                    [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+                    return YES;
+                }
+            }
+            for (UIGestureRecognizer *rec in [deep.gestureRecognizers copy]) {
+                if ([rec isKindOfClass:UITapGestureRecognizer.class] && [self fireTapGesture:(UITapGestureRecognizer *)rec]) {
+                    return YES;
+                }
+            }
+        }
+    }
+
+    // 4. Last resort: push a real touch through the responder chain.
     return [self synthesizeTouchAtPoint:point];
 }
 
@@ -166,11 +201,23 @@
 /// most faithful tap we have — it calls the handler Douyin actually registered,
 /// with no coordinate guessing. Falls back to the point-based path if nothing
 /// tappable is found.
+///
+/// Ancestors are NOT enough for Lynx-rendered controls (UILynxView /
+/// BDImageView / plain UIView containers): the real tap target is buried a few
+/// layers DOWN in the subtree, and the outer container has neither a UIControl
+/// nor a tap gesture of its own. Phase 2 below searches that subtree. Without
+/// it, every such entry degrades to a synthesised UITouch sent straight to the
+/// Lynx container, which Lynx ignores — that is the "panel never opens on
+/// super-bag entries" bug from dyluckybag(18).log
+/// (tapView: no direct target; point-tap fallback → synthesising touch on
+/// UILynxView at {70,160}, three times in a row).
 - (BOOL)tapView:(UIView *)view {
     if (!view) {
         return NO;
     }
 
+    // Phase 1: ancestor walk. Each level independently, so a gesture on a
+    // swipe-only ancestor cannot mask a working tap gesture further up.
     UIView *candidate = view;
     while (candidate) {
         if ([candidate isKindOfClass:UIControl.class]) {
@@ -190,11 +237,32 @@
         candidate = candidate.superview;
     }
 
-    // Nothing directly tappable on the view itself — fall back to the
-    // coordinate-based path at the view's centre.
+    // Phase 2: subtree walk. Lynx-rendered controls bury their real tap target
+    // inside the container; find it and fire it directly so we never depend on
+    // Lynx's IOHID hookup (which UIKit's synthesised UITouch cannot satisfy).
     CGPoint center = [view convertPoint:CGPointMake(CGRectGetMidX(view.bounds),
                                                      CGRectGetMidY(view.bounds))
                                  toView:nil];
+    UIView *deep = [self deepTappableInTree:view screenPoint:center depth:0];
+    if (deep && deep != view && deep.window != nil) {
+        DYLog(@"tapView: deep tappable %@ found in %@'s subtree at %@",
+              NSStringFromClass(deep.class), NSStringFromClass(view.class),
+              NSStringFromCGPoint(center));
+        if ([deep isKindOfClass:UIControl.class]) {
+            UIControl *c = (UIControl *)deep;
+            if (c.enabled && c.userInteractionEnabled && c.allTargets.count > 0) {
+                [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+                return YES;
+            }
+        }
+        for (UIGestureRecognizer *rec in [deep.gestureRecognizers copy]) {
+            if ([rec isKindOfClass:UITapGestureRecognizer.class] && [self fireTapGesture:(UITapGestureRecognizer *)rec]) {
+                return YES;
+            }
+        }
+    }
+
+    // Phase 3: coordinate fallback (existing behaviour).
     DYLog(@"tapView: no direct target; point-tap fallback at %@", NSStringFromCGPoint(center));
     return [self tapAtPoint:center];
 }
@@ -224,6 +292,82 @@
     }
 
     return NO;
+}
+
+/// Depth-first search under `root` for a tappable view whose frame contains
+/// `screenPoint`. Returns the deepest UIView that is either a `UIControl` with
+/// live target-action pairs, or a view carrying a `UITapGestureRecognizer` with
+/// live targets. Caller is responsible for firing the result.
+///
+/// Why ancestors alone miss the target on super-bag entries: TikTok's Lynx
+/// engine renders many live-room controls inside a `UILynxView` (or
+/// `BDImageView` / plain `UIView`) container. The OUTER container has no
+/// `UIControl` or tap gesture of its own, and `hitTest:` returns it as the
+/// deepest view at the touch point — so the up-walks in `-controlAtPoint:` and
+/// `-fireTapGestureAtPoint:` never find anything. The real tap target (often a
+/// `UIControl` carrying Lynx's `LynxGestureHandler`) sits 1–3 layers below and
+/// is non-opaque, so a normal `hitTest:` skips it on Lynx containers. Without
+/// this fallback every such control degrades to a synthesised UITouch that Lynx
+/// ignores, which is why the super-bag floating entry on this build opened
+/// the panel 0/3 times (see dyluckybag(18).log, 10:07–10:08).
+///
+/// Safety: bounded to depth 8 (Lynx trees are shallow), every candidate frame
+/// is checked to contain the screen point (no cross-talk between disjoint
+/// overlays), and the search is skipped entirely when `root` is offscreen.
+/// `UIControl` with targets is preferred over a tap-gesture view at the same
+/// depth, because the former delivers through public API and is the most
+/// faithful tap we have.
+- (UIView *)deepTappableInTree:(UIView *)root
+                   screenPoint:(CGPoint)screenPoint
+                        depth:(NSUInteger)depth {
+    if (!root || depth > 8) {
+        return nil;
+    }
+    if (root.window == nil) {
+        return nil;
+    }
+
+    // Stay inside the subtree's screen rect — Lynx containers are small but
+    // some live overlays stack a full-width subview on top, and we must not let
+    // a stray match from one leak into another's tap.
+    if (root.superview) {
+        CGRect rootScreenRect = [root.superview convertRect:root.bounds toView:nil];
+        if (!CGRectIsEmpty(rootScreenRect) &&
+            !CGRectContainsPoint(rootScreenRect, screenPoint)) {
+            return nil;
+        }
+    }
+
+    // Recurse first (depth-first): a deeper working target beats a shallower one.
+    for (UIView *sub in [root.subviews copy]) {
+        UIView *found = [self deepTappableInTree:sub
+                                     screenPoint:screenPoint
+                                          depth:depth + 1];
+        if (found) {
+            return found;
+        }
+    }
+
+    // Is `root` itself tappable? Prefer UIControl (public API, deterministic),
+    // then a tap-gesture view (private target/action KVC, still far more
+    // reliable than synthesising a touch on Lynx).
+    if ([root isKindOfClass:UIControl.class]) {
+        UIControl *c = (UIControl *)root;
+        if (c.enabled && c.userInteractionEnabled && c.allTargets.count > 0) {
+            return c;
+        }
+    }
+    for (UIGestureRecognizer *rec in [root.gestureRecognizers copy]) {
+        if ([rec isKindOfClass:UITapGestureRecognizer.class]) {
+            // Use the same live-targets check as -fireTapGesture: so an empty
+            // recogniser does not short-circuit a deeper match.
+            NSArray *wrappers = [rec valueForKey:@"targets"];
+            if ([wrappers isKindOfClass:NSArray.class] && wrappers.count > 0) {
+                return root;
+            }
+        }
+    }
+    return nil;
 }
 
 #pragma mark - Synthesised touch
