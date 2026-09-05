@@ -1,0 +1,39 @@
+[32m==>[0m [1mDownloading bottle manifests[0m
+✔︎ Bottle Manifest dpkg (1.23.7)
+✔︎ Bottle Manifest ldid (2.1.5_1)
+[34m==>[0m [1mWould install 2 formulae:[0m
+dpkg ldid
+[34m==>[0m [1mWould install 2 dependencies for dpkg:[0m
+gpatch
+libmd
+[34m==>[0m [1mWould install 1 dependency for ldid:[0m
+libplist
+[32m==>[0m [1mFetching downloads for: [32mdpkg[39m and [32mldid[39m[0m
+✔︎ Bottle Manifest gpatch (2.8)
+✔︎ Bottle Manifest libmd (1.2.0)
+✔︎ Bottle ldid (2.1.5_1)
+✔︎ Bottle gpatch (2.8)
+✔︎ Bottle libmd (1.2.0)
+✔︎ Bottle dpkg (1.23.7)
+✔︎ Bottle Manifest libplist (2.7.0)
+✔︎ Bottle libplist (2.7.0)
+[32m==>[0m [1mInstalling dependencies for dpkg:[0m [32mgpatch[39m and [32mlibmd[39m[0m
+[32m==>[0m [1mInstalling dpkg dependency: [32mgpatch[39m[0m
+[34m==>[0m [1mPouring gpatch--2.8.arm64_sonoma.bottle.tar.gz[0m
+🍺  /opt/homebrew/Cellar/gpatch/2.8: 12 files, 412.4KB
+[32m==>[0m [1mInstalling dpkg dependency: [32mlibmd[39m[0m
+[34m==>[0m [1mPouring libmd--1.2.0.arm64_sonoma.bottle.tar.gz[0m
+🍺  /opt/homebrew/Cellar/libmd/1.2.0: 138 files, 1MB
+[32m==>[0m [1mInstalling [32mdpkg[39m[0m
+[34m==>[0m [1mPouring dpkg--1.23.7.arm64_sonoma.bottle.tar.gz[0m
+🍺  /opt/homebrew/Cellar/dpkg/1.23.7: 740 files, 18.3MB
+[32m==>[0m [1mInstalling ldid dependency: [32mlibplist[39m[0m
+[34m==>[0m [1mPouring libplist--2.7.0.arm64_sonoma.bottle.tar.gz[0m
+🍺  /opt/homebrew/Cellar/libplist/2.7.0: 32 files, 606.6KB
+[32m==>[0m [1mInstalling [32mldid[39m[0m
+[34m==>[0m [1mPouring ldid--2.1.5_1.arm64_sonoma.bottle.1.tar.gz[0m
+🍺  /opt/homebrew/Cellar/ldid/2.1.5_1: 6 files, 270.1KB
+[32m==>[0m [1mCaveats[0m
+[34m==>[0m [1mdpkg[0m
+This installation of dpkg is not configured to install software, so
+commands such as `dpkg -i`, `dpkg --configure` will fail.

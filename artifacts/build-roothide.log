@@ -1,0 +1,96 @@
++ rm -rf /Users/runner/work/dyluckybag/dyluckybag/theos
++ '[' roothide = roothide ']'
++ echo '== cloning roothide/theos (the only theos that knows the roothide scheme) =='
+== cloning roothide/theos (the only theos that knows the roothide scheme) ==
++ git clone --recursive --depth 1 https://github.com/roothide/theos.git /Users/runner/work/dyluckybag/dyluckybag/theos
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos'...
+Submodule 'vendor/dm.pl' (https://github.com/theos/dm.pl.git) registered for path 'vendor/dm.pl'
+Submodule 'vendor/include' (https://github.com/roothide/headers.git) registered for path 'vendor/include'
+Submodule 'vendor/lib' (https://github.com/roothide/lib.git) registered for path 'vendor/lib'
+Submodule 'vendor/logos' (https://github.com/theos/logos.git) registered for path 'vendor/logos'
+Submodule 'vendor/nic' (https://github.com/theos/nic.git) registered for path 'vendor/nic'
+Submodule 'vendor/orion' (https://github.com/theos/orion.git) registered for path 'vendor/orion'
+Submodule 'vendor/swift-support' (https://github.com/theos/swift-support.git) registered for path 'vendor/swift-support'
+Submodule 'vendor/templates' (https://github.com/theos/templates.git) registered for path 'vendor/templates'
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/dm.pl'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/include'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/lib'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/logos'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/nic'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/orion'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/swift-support'...
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/templates'...
+Submodule path 'vendor/dm.pl': checked out 'd9a3b72e274226dd2823c0a7c1d6d05099f4f51c'
+Submodule path 'vendor/include': checked out 'ac1c4fd21214548d6d308fcb835d30df1e43953d'
+Submodule path 'vendor/lib': checked out '85e9b5b8aff11bbefc59525c64c8f55149926e56'
+Submodule path 'vendor/logos': checked out 'a62370066a97e36d59b200a9fa10c5091f5e8972'
+Submodule path 'vendor/nic': checked out '4e7adcbeac2e4636b91e2f76341adfe4c4d0ceec'
+Submodule path 'vendor/orion': checked out 'c0ed879ecaae16f3c8d06a6c36302f6c78d1f7e4'
+Submodule 'fishhook' (https://github.com/facebook/fishhook.git) registered for path 'vendor/orion/fishhook'
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/vendor/orion/fishhook'...
+Submodule path 'vendor/orion/fishhook': checked out 'aadc161ac3b80db07a9908851839a17ba63a9eb1'
+Submodule path 'vendor/swift-support': checked out '4cf59ff04cdb2ceb27ea2228753e0497297b6182'
+Submodule path 'vendor/templates': checked out '6c3944e281c4726f1383755d0fbb642840312d28'
++ rm -rf /Users/runner/work/dyluckybag/dyluckybag/theos/sdks
++ git clone --filter=blob:none --sparse --depth 1 https://github.com/theos/sdks.git /Users/runner/work/dyluckybag/dyluckybag/theos/sdks
+Cloning into '/Users/runner/work/dyluckybag/dyluckybag/theos/sdks'...
++ git -C /Users/runner/work/dyluckybag/dyluckybag/theos/sdks sparse-checkout set iPhoneOS16.5.sdk
++ BUILD_SCHEME=roothide
++ BUILD_ARCHS=arm64e
++ sed -i.bak -E 's|^Depends:.*|Depends: firmware (>= 15.0)|' control
++ echo '== building scheme: roothide (theos layout: roothide, arch: arm64e) =='
+== building scheme: roothide (theos layout: roothide, arch: arm64e) ==
++ echo '== building RELEASE (DYLog compiled out) =='
+== building RELEASE (DYLog compiled out) ==
++ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide ARCHS=arm64e
+[0;36m==> [1;36mNotice:[m Build may be slow as Theos isn’t using all available CPU cores on this computer. Consider upgrading GNU Make: https://theos.dev/docs/parallel-building
+[1;31m> [1;3;39mMaking all for tweak DYLuckyBag…[m
+[0;31m==> [1;39mPreprocessing DYLuckyBag.xm…[m
+[0;32m==> [1;39mCompiling DYLuckyBag.xm (arm64e)…[m
+[0;32m==> [1;39mCompiling DYConfig.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYOCRDetector.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYViewDetector.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYTouch.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYEngine.m (arm64e)…[m
+[1mDYEngine.m:1481:21: [0m[0;1;35mwarning: [0m[1munused variable 'hit' [-Wunused-variable][0m
+    for (DYViewHit *hit in hits) {
+[0;1;32m                    ^
+[0m1 warning generated.
+[0;32m==> [1;39mCompiling DYPanel.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYLog.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYCrashLog.m (arm64e)…[m
+[0;33m==> [1;39mLinking tweak DYLuckyBag (arm64e)…[m
+ld: warning: -multiply_defined is obsolete
+[0;34m==> [1;39mGenerating debug symbols for DYLuckyBag…[m
+[0;34m==> [1;39mStripping DYLuckyBag (arm64e)…[m
+[0;34m==> [1;39mSigning DYLuckyBag…[m
+[1;31m> [1;3;39mMaking stage for tweak DYLuckyBag…[m
+dm.pl: building package `com.yxh41.dyluckybag:iphoneos-arm64e' in `./packages/com.yxh41.dyluckybag_0.1.0_iphoneos-arm64e.deb'
++ mkdir -p out-rel
++ cp packages/com.yxh41.dyluckybag_0.1.0_iphoneos-arm64e.deb out-rel/DYLuckyBag-roothide.deb
++ echo '== building DEBUG (DYLog + file sink, for field diagnosis) =='
+== building DEBUG (DYLog + file sink, for field diagnosis) ==
++ make clean
+[0;36m==> [1;39mCleaning…[m
++ rm -rf packages
++ make package DEBUG=1 THEOS_PACKAGE_SCHEME=roothide ARCHS=arm64e
+[0;36m==> [1;36mNotice:[m Build may be slow as Theos isn’t using all available CPU cores on this computer. Consider upgrading GNU Make: https://theos.dev/docs/parallel-building
+[1;31m> [1;3;39mMaking all for tweak DYLuckyBag…[m
+[0;31m==> [1;39mPreprocessing DYLuckyBag.xm…[m
+[0;32m==> [1;39mCompiling DYLuckyBag.xm (arm64e)…[m
+[0;32m==> [1;39mCompiling DYConfig.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYOCRDetector.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYViewDetector.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYTouch.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYEngine.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYPanel.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYLog.m (arm64e)…[m
+[0;32m==> [1;39mCompiling DYCrashLog.m (arm64e)…[m
+[0;33m==> [1;39mLinking tweak DYLuckyBag (arm64e)…[m
+ld: warning: -multiply_defined is obsolete
+[0;34m==> [1;39mGenerating debug symbols for DYLuckyBag…[m
+[0;34m==> [1;39mSigning DYLuckyBag…[m
+[1;31m> [1;3;39mMaking stage for tweak DYLuckyBag…[m
+dm.pl: building package `com.yxh41.dyluckybag:iphoneos-arm64e' in `./packages/com.yxh41.dyluckybag_0.1.0-1+debug_iphoneos-arm64e.deb'
++ mkdir -p out-dbg
++ cp packages/com.yxh41.dyluckybag_0.1.0-1+debug_iphoneos-arm64e.deb out-dbg/DYLuckyBag-roothide-debug.deb
