@@ -90,6 +90,10 @@ static const NSInteger kCommentMaxAttempts = 6;
 @property (nonatomic, copy) NSString *superBagComment;   // fixed comment a 超级福袋 prints on its card
 @property (nonatomic) BOOL superBagActive;               // re-detected every scan; NOT cleared at end of handleHits
 @property (nonatomic) BOOL isTrueSuperBag;               // card literally says 超级福袋 (OCR or view tree) — drives the bitmap OCR one-tap
+// YES when this scan saw a countdown (后开奖 / 距开抢 / 倒计时 …). Douyin silently
+// ignores a 一键发表评论 press while the bag has not opened, so a tap made now must
+// NOT be counted as a join — and must not burn the retry cooldown either.
+@property (nonatomic) BOOL countdownActive;
 @property (nonatomic) BOOL ocrBusy;                      // guards re-entrant async OCR one-tap calls
 // Follow-gate debounce: -attemptCommentSend: runs up to 6 passes and tapped the
 // SAME gate on every pass on device (7x '粉丝团' in a row), which kept popping the
@@ -132,7 +136,8 @@ static const NSInteger kCommentMaxAttempts = 6;
                       bagHit:(DYTextHit *)bagHit
                    countdown:(BOOL)countdown
                        entry:(DYViewHit *)entryFromJoinScan;
-- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown;
+- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown
+                                            hits:(NSArray<DYTextHit *> *)hits;
 // Comment / 口令 bag participation (Option B).
 - (void)sendCommentWithKeyword:(NSString *)keyword tapPoint:(CGPoint)pt;
 - (void)attemptCommentSend:(NSString *)keyword attempt:(NSInteger)attempt;
@@ -324,6 +329,8 @@ static const NSInteger kCommentMaxAttempts = 6;
     //   - panel open   => a 参与 hit is the real join button.
     BOOL panelUp   = [self bagPanelVisibleInHits:hits];
     BOOL countdown = [self countdownVisibleInHits:hits];
+    // Read later by the one-tap paths: a press Douyin ignores must not be counted.
+    self.countdownActive = countdown;
     if (panelUp) {
         // The entry tap did its job (or the user opened the panel by hand). Clear
         // the flag so a later 未打开 state is diagnosed as a fresh failure rather
@@ -415,7 +422,7 @@ static const NSInteger kCommentMaxAttempts = 6;
             // Panel up, no 参与 button on it. For a 评论福袋 that is expected:
             // participation IS posting the comment. Hand over to the comment flow
             // (guarded against overlapping chains) instead of reporting nothing.
-            [self runCommentFlowOnOpenPanelDuringCountdown:countdown];
+            [self runCommentFlowOnOpenPanelDuringCountdown:countdown hits:hits];
             return;
         }
         joinLabel = joinOCR.text;
@@ -795,22 +802,39 @@ static const NSInteger kCommentMaxAttempts = 6;
 /// 检测到福袋，未找到参与按钮 here and never posted anything.
 ///
 /// `countdown` matters: while the panel still reads 距开抢 mm:ss the bag has not
-/// opened yet and nothing can be posted, so a comment chain fired now would burn
-/// its 6 attempts against a dead panel and log a phantom result. During a countdown
-/// we therefore require a REAL affordance (the one-tap button or an actual input
-/// field) and otherwise just wait for the flip.
+/// opened yet. A plain bag must wait for the flip — there is nothing to press.
+/// A 超级福袋 does NOT: its 一键发表评论 button is already on screen, so we press
+/// it now and keep pressing. Douyin drops those presses while the clock runs, which
+/// is why the one-tap paths (see countdownActive) neither count a join nor consume
+/// the retry debounce for a tap made during a countdown.
+///
+/// Waiting was the Build #56 behaviour and it lost the window entirely: 22 passes
+/// logged `captured specified comment` and tapped nothing, and by the time 后开奖
+/// cleared the panel had usually closed (dyluckybag(18).log).
 ///
 /// Rate-limited either way: -handleHits runs every 1.5s while -attemptCommentSend:
 /// retries for ~5s, so an unguarded call would stack overlapping chains.
-- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown {
+- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown
+                                            hits:(NSArray<DYTextHit *> *)hits {
     self.state = DYEngineStateBagDetected;
 
     if ([DYConfig shared].patrolMode == DYPatrolModeDetectOnly) {
         [self updateStatus:@"[仅检测] 福袋面板已打开（无参与按钮）"];
+        // Both early returns here used to be silent — with the tweak apparently
+        // dead (bag detected, comment captured, zero taps) and nothing in the log
+        // to explain it. See dyluckybag(18).log: 22 passes of
+        // `super bag: captured specified comment` with no action at all.
+        DYLog(@"panel open, detect-only mode — not acting");
         return;
     }
     if (![DYConfig shared].commentKeywordAutoSend) {
-        [self updateStatus:@"福袋面板已打开，未开启自动评论"];
+        // This bag has NO 参与 button — posting the comment IS the participation,
+        // so this flow is the only way in. Turning off 评论口令自动发送 therefore
+        // disables joining this whole class of bag, not just the typing. Say so
+        // plainly instead of the vague "未开启自动评论".
+        [self updateStatus:@"评论福袋需开启「评论口令自动发送」才能参与"];
+        DYLog(@"panel open with no 参与 button — the comment flow is the ONLY way "
+              @"to join this bag, but commentKeywordAutoSend is OFF — not acting");
         return;
     }
 
@@ -819,10 +843,29 @@ static const NSInteger kCommentMaxAttempts = 6;
     // comment flow fire into the live-room chat during a countdown. Require either
     // the one-tap button or an input that is genuinely live (focused, or already
     // holding text from a popped 口令 sheet).
+    //
+    // The 一键发表评论 button of a 超级福袋 is a Lynx bitmap: the view tree often
+    // exposes no text node for it, but OCR reads pixels and sees it every pass
+    // (dyluckybag(18): [一键发表评论 @195,747 c=1.00]). Accept the OCR hit as an
+    // affordance too, otherwise a perfectly visible button reads as "nothing to do".
     BOOL oneClick = [DYViewDetector firstViewWithTextContaining:kWordOneClickComment] != nil;
+    if (!oneClick && hits.count > 0) {
+        for (NSString *kw in @[ kWordOneClickComment, @"一键发送", @"一键评论" ]) {
+            if ([hits dy_firstHitContaining:kw]) {
+                oneClick = YES;
+                break;
+            }
+        }
+    }
     DYViewHit *input = [DYViewDetector firstInputField];
     BOOL realInput = (input != nil) && (input.view.isFirstResponder || input.text.length > 0);
-    BOOL actionable = oneClick || realInput;
+    // A 超级福袋 whose card comment we already captured is actionable even while
+    // the countdown is still running. Build #56 waited for 后开奖 to clear first,
+    // which meant the comment path was never entered at all: 22 consecutive passes
+    // logged `captured specified comment` and tapped nothing, and by the time the
+    // clock hit zero the panel had usually closed (dyluckybag(18).log).
+    BOOL bagCommentReady = self.superBagComment.length > 0 || self.isTrueSuperBag;
+    BOOL actionable = oneClick || realInput || bagCommentReady;
     if (countdown && !actionable) {
         // Pre-open bag: panel is up, participation is not live yet. Sit on it —
         // the next pass will see the 参与 button the moment Douyin enables it.
@@ -830,6 +873,13 @@ static const NSInteger kCommentMaxAttempts = 6;
         DYLog(@"panel open during countdown with no actionable comment affordance "
               @"— waiting for the bag to open");
         return;
+    }
+    if (countdown && bagCommentReady) {
+        // Do not wait out the countdown on a 超级福袋. Douyin no-ops a one-tap
+        // press while the clock runs, so trying early is harmless; waiting is what
+        // lost the window (the panel disappears right as the bag opens).
+        DYLog(@"panel open during countdown but the super-bag comment is ready "
+              @"— acting now instead of waiting for the clock");
     }
 
     BOOL hasCommentContext = actionable
@@ -1036,6 +1086,17 @@ static const NSInteger kCommentMaxAttempts = 6;
                 DYLog(@"super bag: tapping '%@' (comment='%@')",
                       oneClick.text, strongSelf.superBagComment ?: @"(posted by Douyin)");
                 [[DYTouch shared] tapView:oneClick.view];
+                if (strongSelf.countdownActive) {
+                    // Douyin swallows a 一键发表评论 press while 后开奖 is still on
+                    // screen. Counting it would inflate the join counter and report
+                    // a win that never happened; burning the 8s chain debounce would
+                    // leave us sitting out exactly when the bag opens. So: tap, log,
+                    // and let the next scan try again immediately.
+                    DYLog(@"super bag: tapped during the countdown — Douyin ignores "
+                          @"it; not counting a join, retrying on the next pass");
+                    strongSelf.lastCommentChainTime = 0;
+                    return;
+                }
                 [strongSelf finishOneClickComment];
                 return;
             }
@@ -1255,6 +1316,15 @@ static const NSInteger kCommentMaxAttempts = 6;
                   btn.text, CGRectGetMidX(btn.rect), CGRectGetMidY(btn.rect),
                   strongSelf.superBagComment ?: @"(posted by Douyin)");
             [[DYTouch shared] tapInRect:btn.rect];
+            if (strongSelf.countdownActive) {
+                // Same rule as the view-tree path: 后开奖 on screen means Douyin
+                // drops the press. Do not count it, and release the debounce so we
+                // are retrying — not cooling down — when the bag opens.
+                DYLog(@"super bag: OCR-tapped during the countdown — Douyin ignores "
+                      @"it; not counting a join, retrying on the next pass");
+                strongSelf.lastCommentChainTime = 0;
+                return;
+            }
             [strongSelf finishOneClickComment];
             return;
         }
