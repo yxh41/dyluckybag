@@ -1,0 +1,5 @@
+scheme=rootless sha=6e99642b9f6bd995531ee016c776c2cc432b06d2
+install.log: present
+build.log:   present
+release deb: present
+debug deb:   present
