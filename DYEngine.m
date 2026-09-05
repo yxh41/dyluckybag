@@ -32,10 +32,37 @@ static NSString *const kWordFanClubTask = @"福袋任务";
 // (see dyluckybag(16).log: 6x "input not ready" -> "no comment box").
 static NSString *const kWordOneClickComment = @"一键发表评论";
 
+// While a bag is counting down, Douyin labels the floating room entry with the
+// remaining time ("距开抢 04:32") and only flips it to 待参与 / 参与 once the draw
+// window opens. Waiting for that flip is why the tweak looked dead during the
+// countdown ("只要福袋是显示倒计时的就识别不到"): the 参与 button does not exist
+// outside the panel. The entry itself is tappable the whole time, so we open the
+// panel ourselves and read the real button from inside it.
+static NSArray<NSString *> *const kCountdownWords = @[
+    @"距开抢", @"开抢", @"倒计时", @"即将开始", @"未开始", @"后开奖"
+];
+// Text that only exists once the bag panel is ON SCREEN. Tapping the entry again
+// while the panel is up would toggle it shut, so the entry tap is suppressed
+// whenever one of these is visible. Deliberately excludes 距开抢 (that also sits
+// on the collapsed entry) and 说点什么 (the room's own chat box uses it too).
+static NSArray<NSString *> *const kBagPanelWords = @[
+    @"参与条件", @"福袋任务", @"中奖名单", @"一键发表评论", @"发送评论",
+    @"参与人数", @"人已参与", @"奖品"
+];
+// The floating entry lives in the upper-left of the live room (device log:
+// join='待参与' at y≈160 on an 812pt screen). The bag panel is a bottom sheet.
+// So when the panel is up, the join candidate to act on is the LOWER one — this
+// keeps us from tapping the entry (which would dismiss the panel) instead of the
+// panel's own button.
+static const CGFloat kPanelTopFraction = 0.45;
+
 // A tap landing within this radius of the previous tap is treated as the same
 // button, so we do not hammer "join" on every scan pass.
 static const CGFloat kTapProximity = 44.0;
 static const NSTimeInterval kTapCooldown = 6.0;
+// The entry tap opens a panel, so it needs a much longer window than a button
+// tap: re-tapping would close the panel we just opened and start a flicker loop.
+static const NSTimeInterval kBagEntryCooldown = 12.0;
 
 // Scan cadence adapts to whether a lucky bag is actually on screen. Fast while
 // one is present (we want to catch the "参与" button immediately); slow when the
@@ -76,11 +103,36 @@ static const NSInteger kCommentMaxAttempts = 6;
 @property (nonatomic) BOOL lastCommentWasOneClick;
 @property (nonatomic) NSInteger quietPasses;
 @property (nonatomic) NSTimeInterval currentInterval;
+// Bag-entry (collapsed floating entry) tap bookkeeping. Opening the panel is a
+// different action from joining, so it gets its own, much longer cooldown: a
+// second tap would close the panel we just opened.
+@property (nonatomic) CFTimeInterval lastEntryTapTime;
+@property (nonatomic) BOOL panelOpenedByUs;
+@property (nonatomic) NSInteger bagEntryOpenAttempts;
+// Rate-limits -runCommentFlowOnOpenPanel: handleHits fires every 1.5s while a
+// comment chain runs for ~5s, so without this the chains would overlap.
+@property (nonatomic) CFTimeInterval lastCommentChainTime;
 
 // Declared up front so -Werror never trips on a forward reference.
 - (DYTextHit *)joinButtonHitFromHits:(NSArray<DYTextHit *> *)hits;
 - (DYViewHit *)validJoinView:(DYViewHit *)candidate;
 - (void)verifyTapAtPoint:(CGPoint)point;
+// Countdown / collapsed-entry handling.
+- (BOOL)bagPanelVisibleInHits:(NSArray<DYTextHit *> *)hits;
+- (BOOL)countdownVisibleInHits:(NSArray<DYTextHit *> *)hits;
+- (DYViewHit *)bagEntryView;
+- (DYTextHit *)bagEntryHitFromHits:(NSArray<DYTextHit *> *)hits;
+- (DYTextHit *)countdownEntryHitFromHits:(NSArray<DYTextHit *> *)hits;
+- (NSArray<DYViewHit *> *)joinCandidates;
+- (DYViewHit *)joinViewWithPanelUp:(BOOL)panelUp;
+- (DYTextHit *)panelJoinHitFromHits:(NSArray<DYTextHit *> *)hits;
+- (DYViewHit *)joinedIndicatorView;
+- (BOOL)joinedIndicatorInHits:(NSArray<DYTextHit *> *)hits;
+- (void)openBagPanelFromHits:(NSArray<DYTextHit *> *)hits
+                      bagHit:(DYTextHit *)bagHit
+                   countdown:(BOOL)countdown
+                       entry:(DYViewHit *)entryFromJoinScan;
+- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown;
 // Comment / 口令 bag participation (Option B).
 - (void)sendCommentWithKeyword:(NSString *)keyword tapPoint:(CGPoint)pt;
 - (void)attemptCommentSend:(NSString *)keyword attempt:(NSInteger)attempt;
@@ -219,11 +271,19 @@ static const NSInteger kCommentMaxAttempts = 6;
     BOOL bagByOCR = (bagHit != nil);
 
     DYViewHit *bagView    = [DYViewDetector firstViewWithTextContaining:kWordBag];
-    DYViewHit *joinedView = [DYViewDetector firstViewWithTextContaining:@"已参与"];
-    DYViewHit *rawJoin = joinedView ? nil : [DYViewDetector firstViewWithTextContaining:kWordJoin];
-    DYViewHit *joinView = [self validJoinView:rawJoin];
+    // "已参与" must come from the button/badge, never from a counter such as
+    // "1234人已参与" or "参与人数 9" — those are always on the panel, so matching
+    // them would make the engine believe the bag was joined and skip the tap.
+    DYViewHit *joinedView = [self joinedIndicatorView];
 
-    BOOL sawBag = bagByOCR || (bagView != nil);
+    // A countdown entry shows ONLY "距开抢 mm:ss" with no 福袋 word for OCR, so
+    // neither bagByOCR nor bagView fires — that is the "识别不到" case. Catch it by
+    // the countdown text alone (upper-area only, so a feed flash-sale card can't
+    // fake it). We do NOT need the exact text as a target; opening the panel reads
+    // the real button from inside.
+    DYTextHit *countdownEntry = [self countdownEntryHitFromHits:hits];
+
+    BOOL sawBag = bagByOCR || (bagView != nil) || (countdownEntry != nil);
     self.quietPasses = sawBag ? 0 : (self.quietPasses + 1);
     [self adaptScanRate];
 
@@ -243,17 +303,43 @@ static const NSInteger kCommentMaxAttempts = 6;
         }
     }
 
-    // 2. No bag anywhere (neither OCR nor view tree)?
-    if (!bagByOCR && !bagView) {
+    // 2. No bag anywhere (neither OCR nor view tree)? A countdown entry counts as a
+    //    bag (it is the floating entry with no 福袋 word for OCR — see above).
+    if (!bagByOCR && !bagView && !countdownEntry) {
         if (self.state != DYEngineStateIdle) {
             self.state = DYEngineStateIdle;
             [self updateStatus:@"当前直播间没有福袋"];
         }
+        // No bag on screen — forget the entry/panel bookkeeping so the next room
+        // starts clean (and the open-attempt cap is not carried across rooms).
+        self.panelOpenedByUs = NO;
+        self.bagEntryOpenAttempts = 0;
         return;
     }
 
-    DYLog(@"bag detected (ocr=%d viewTree=%d)%@",
-          bagByOCR, bagView != nil,
+    // Panel vs collapsed entry. This distinction is the core of both reported
+    // bugs and must be known BEFORE we decide what a 参与 hit means:
+    //   - panel closed => any 参与/待参与 text belongs to the floating entry, and
+    //     tapping it merely OPENS the panel (it is not a join);
+    //   - panel open   => a 参与 hit is the real join button.
+    BOOL panelUp   = [self bagPanelVisibleInHits:hits];
+    BOOL countdown = [self countdownVisibleInHits:hits];
+    if (panelUp) {
+        // The entry tap did its job (or the user opened the panel by hand). Clear
+        // the flag so a later 未打开 state is diagnosed as a fresh failure rather
+        // than blamed on this success.
+        self.panelOpenedByUs = NO;
+        self.bagEntryOpenAttempts = 0;
+    }
+
+    // Scan EVERY 参与 hit rather than just the first: once the panel is open the
+    // first match in tree order is usually the "参与条件" label, and taking only
+    // -firstViewWithTextContaining: hid the real button behind it. With the panel
+    // up we also prefer the LOWER candidate (bottom sheet) over the floating entry.
+    DYViewHit *joinView = joinedView ? nil : [self joinViewWithPanelUp:panelUp];
+
+    DYLog(@"bag detected (ocr=%d viewTree=%d panel=%d countdown=%d)%@",
+          bagByOCR, bagView != nil, panelUp, countdown,
           joinView ? [NSString stringWithFormat:@" join='%@'", joinView.text] : @"");
 
     // 3. Extract the keyword (口令) if the bag requires a comment to enter.
@@ -287,14 +373,34 @@ static const NSInteger kCommentMaxAttempts = 6;
     }
 
     // 4. Already joined? Then we are waiting for the draw, not tapping again.
-    if ((bagByOCR && [hits dy_firstHitContaining:@"已参与"]) || joinedView) {
+    //    OCR side must also ignore counters ("1234人已参与") — see -joinedIndicatorView.
+    if ([self joinedIndicatorInHits:hits] || joinedView) {
         self.state = DYEngineStateWaitingResult;
         [self updateStatus:@"已参与，等待开奖"];
         return;
     }
 
-    // 5. Locate the join button. Prefer the real UIView from the view tree so
-    //    we can fire its handler directly; fall back to the OCR rect.
+    // 4b. Panel vs entry was resolved above (panelUp / countdown).
+    // 5. Classify the target. The collapsed floating entry and the panel's own
+    //    join button BOTH match 参与 / 待参与, but they mean completely different
+    //    things and conflating them is the second reported bug ("福袋并未成功参与"):
+    //      - entry tap  -> merely OPENS the bag panel. It is NOT a join. Old builds
+    //        counted it as one and then ran the comment flow against a panel that
+    //        has no comment box, producing a phantom "已参与（无评论框）" for a bag
+    //        the tweak had never actually entered (see dyluckybag(10/17).log:
+    //        join='待参与' at y≈160 — that y is the floating entry, not the panel).
+    //      - panel button tap -> the real join; the comment flow belongs here.
+    //    panelUp is the discriminator: no panel on screen => whatever we tap can
+    //    only be the entry.
+    if (!panelUp) {
+        [self openBagPanelFromHits:hits
+                            bagHit:bagHit
+                         countdown:countdown
+                             entry:joinView];
+        return;
+    }
+
+    // 5b. Panel is up: find the real join control inside it.
     UIView *joinTargetView = nil;
     CGPoint center;
     NSString *joinLabel;
@@ -304,10 +410,12 @@ static const NSInteger kCommentMaxAttempts = 6;
                               CGRectGetMidY(joinView.screenRect));
         joinTargetView = joinView.view;
     } else {
-        DYTextHit *joinOCR = [self joinButtonHitFromHits:hits];
+        DYTextHit *joinOCR = [self panelJoinHitFromHits:hits];
         if (!joinOCR) {
-            self.state = DYEngineStateBagDetected;
-            [self updateStatus:@"检测到福袋，未找到参与按钮"];
+            // Panel up, no 参与 button on it. For a 评论福袋 that is expected:
+            // participation IS posting the comment. Hand over to the comment flow
+            // (guarded against overlapping chains) instead of reporting nothing.
+            [self runCommentFlowOnOpenPanelDuringCountdown:countdown];
             return;
         }
         joinLabel = joinOCR.text;
@@ -376,6 +484,380 @@ static const NSInteger kCommentMaxAttempts = 6;
         DYLog(@"handleHits: caught exception (%@): %@", exception.name, exception.reason);
         [self updateStatus:@"检测/参与异常，已跳过"];
     }
+}
+
+#pragma mark - Countdown / collapsed entry
+
+/// YES when the bag PANEL (the sheet with the join button) is on screen, as
+/// opposed to the collapsed floating entry. Used to decide whether tapping the
+/// entry would open the panel or close the one we just opened.
+- (BOOL)bagPanelVisibleInHits:(NSArray<DYTextHit *> *)hits {
+    for (NSString *w in kBagPanelWords) {
+        if ([hits dy_firstHitContaining:w]) {
+            return YES;
+        }
+        if ([DYViewDetector firstViewWithTextContaining:w]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// YES when a countdown is visible ("距开抢 04:32" / "开抢倒计时"). Both the
+/// collapsed entry and the open panel show it, so this alone does not tell us
+/// which is up — pair it with -bagPanelVisibleInHits:.
+- (BOOL)countdownVisibleInHits:(NSArray<DYTextHit *> *)hits {
+    for (NSString *w in kCountdownWords) {
+        if ([hits dy_firstHitContaining:w]) {
+            return YES;
+        }
+        if ([DYViewDetector firstViewWithTextContaining:w]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// The collapsed floating bag entry in the live room, from the view tree. This is
+/// the thing that shows "福袋 距开抢 mm:ss" while the draw has not opened; tapping
+/// it presents the bag panel that actually carries the 参与 button.
+///
+/// Deliberately excludes the panel-only strings and the chat-message noise: a
+/// viewer typing "福袋" in chat must never be treated as the entry — tapping a chat
+/// row opens that viewer's profile and covers the whole room.
+- (DYViewHit *)bagEntryView {
+    NSArray<DYViewHit *> *hits = [DYViewDetector findViewsWithTextContaining:@[ kWordBag ]];
+    CGFloat cutoff = UIScreen.mainScreen.bounds.size.height * kPanelTopFraction;
+    DYViewHit *best = nil;
+    for (DYViewHit *hit in hits) {
+        NSString *t = hit.text ?: @"";
+        if (t.length == 0 || t.length > 24) {
+            continue;   // long strings are chat lines / descriptions, not the entry
+        }
+        // Panel headers also contain 福袋 ("福袋任务", "超级福袋" title). Tapping
+        // those does nothing useful and may dismiss the panel.
+        if ([t rangeOfString:@"任务"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"名单"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"说点"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"条件"].location != NSNotFound) continue;
+        if (CGRectIsEmpty(hit.screenRect)) {
+            continue;
+        }
+        // The entry floats in the UPPER part of the room (device log: y≈160 on an
+        // 812pt screen). The chat stream and the bottom toolbar live below the
+        // cutoff, so anything down there is not the entry.
+        if (CGRectGetMidY(hit.screenRect) >= cutoff) {
+            continue;
+        }
+        // Prefer whatever is tappable; otherwise keep the first plausible node so
+        // DYTouch's coordinate fallback still has a target.
+        if (hit.isControl) {
+            return hit;
+        }
+        if (!best) {
+            best = hit;
+        }
+    }
+    return best;
+}
+
+/// OCR counterpart of -bagEntryView, used when the entry is a Lynx bitmap with no
+/// readable text node. Same reasoning: upper area only, and never a chat line.
+- (DYTextHit *)bagEntryHitFromHits:(NSArray<DYTextHit *> *)hits {
+    CGFloat cutoff = UIScreen.mainScreen.bounds.size.height * kPanelTopFraction;
+    for (DYTextHit *h in [hits dy_hitsContaining:kWordBag]) {
+        NSString *t = h.text ?: @"";
+        if (t.length == 0 || t.length > 24) continue;
+        if ([t rangeOfString:@"任务"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"名单"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"条件"].location != NSNotFound) continue;
+        if (CGRectIsEmpty(h.rect)) continue;
+        if (CGRectGetMidY(h.rect) >= cutoff) continue;
+        return h;
+    }
+    return nil;
+}
+
+/// During a countdown the collapsed entry often shows ONLY the remaining time
+/// ("距开抢 mm:ss" / "开抢倒计时") and the word 福袋 never reaches OCR, so the
+/// generic "no 福袋 text" exit would wrongly report "当前直播间没有福袋" — that is
+/// exactly the "识别不到" complaint. This catches that entry by its countdown text
+/// alone, constrained to the upper area so a 商品 flash-sale "距开抢" card (which
+/// sits lower in the feed) cannot masquerade as the bag.
+- (DYTextHit *)countdownEntryHitFromHits:(NSArray<DYTextHit *> *)hits {
+    CGFloat cutoff = UIScreen.mainScreen.bounds.size.height * kPanelTopFraction;
+    for (NSString *kw in kCountdownWords) {
+        for (DYTextHit *h in [hits dy_hitsContaining:kw]) {
+            if (CGRectIsEmpty(h.rect)) continue;
+            if (CGRectGetMidY(h.rect) >= cutoff) continue;   // not the floating entry
+            return h;
+        }
+    }
+    return nil;
+}
+
+/// Every plausible 参与 / 待参与 control on screen, in tree order. Scanning ALL of
+/// them (instead of -firstViewWithTextContaining:) matters because in tree order
+/// "参与条件" and "1234人已参与" usually come before the real button and used to
+/// mask it entirely.
+- (NSArray<DYViewHit *> *)joinCandidates {
+    NSArray<DYViewHit *> *hits =
+        [DYViewDetector findViewsWithTextContaining:@[ kWordJoin, @"待参与", @"立即参与" ]];
+    NSMutableArray<DYViewHit *> *out = [NSMutableArray array];
+    for (DYViewHit *hit in hits) {
+        DYViewHit *valid = [self validJoinView:hit];
+        if (valid) {
+            [out addObject:valid];
+        }
+    }
+    return out;
+}
+
+/// Picks the join control to act on.
+///
+/// `panelUp == YES`: only accept a candidate in the LOWER part of the screen — the
+/// bag panel is a bottom sheet, while the collapsed entry floats near the top
+/// (device log: join='待参与' at y≈160). Tapping the entry with the panel open would
+/// dismiss the panel, which is how earlier builds "参与" without ever joining.
+///
+/// `panelUp == NO`: only accept an UPPER candidate — that is the entry, returned so
+/// the caller can tap it to OPEN the panel (not to join).
+- (DYViewHit *)joinViewWithPanelUp:(BOOL)panelUp {
+    NSArray<DYViewHit *> *candidates = [self joinCandidates];
+    if (candidates.count == 0) {
+        return nil;
+    }
+    CGFloat cutoff = UIScreen.mainScreen.bounds.size.height * kPanelTopFraction;
+    if (!panelUp) {
+        // Entry only: it floats in the UPPER area. A 参与 hit below the cutoff with
+        // no panel on screen is a chat row ("小明参与了福袋") — tapping it opens that
+        // viewer's profile. Prefer a tappable upper node, else any upper node.
+        DYViewHit *upperAny = nil;
+        for (DYViewHit *hit in candidates) {
+            if (CGRectGetMidY(hit.screenRect) >= cutoff) {
+                continue;
+            }
+            if (hit.isControl) {
+                return hit;
+            }
+            if (!upperAny) {
+                upperAny = hit;
+            }
+        }
+        return upperAny;
+    }
+
+    DYViewHit *lowerControl = nil, *lowerAny = nil;
+    for (DYViewHit *hit in candidates) {
+        if (CGRectGetMidY(hit.screenRect) < cutoff) {
+            continue;   // upper area => the floating entry, NOT the panel button
+        }
+        if (hit.isControl && !lowerControl) lowerControl = hit;
+        if (!lowerAny)                      lowerAny = hit;
+    }
+    // Deliberately returns nil when every candidate sits in the upper area: with
+    // the panel open, the only 参与-ish text up there is the floating entry, and
+    // tapping that DISMISSES the panel we just opened. nil sends the caller to the
+    // OCR pick (also panel-filtered) and then to the comment flow, which is the
+    // correct handling for a panel whose button is a Lynx bitmap.
+    return lowerControl ?: lowerAny;
+}
+
+/// OCR counterpart of the panel filter above. -joinButtonHitFromHits: has no idea
+/// whether a rect belongs to the panel or to the floating entry, so with the panel
+/// open it would happily hand back the entry's 待参与 at y≈160 and we would tap the
+/// panel shut. Restrict it to the bottom-sheet area.
+- (DYTextHit *)panelJoinHitFromHits:(NSArray<DYTextHit *> *)hits {
+    CGFloat cutoff = UIScreen.mainScreen.bounds.size.height * kPanelTopFraction;
+    NSMutableArray<DYTextHit *> *lower = [NSMutableArray array];
+    for (DYTextHit *h in hits) {
+        if (CGRectGetMidY(h.rect) >= cutoff) {
+            [lower addObject:h];
+        }
+    }
+    return [self joinButtonHitFromHits:lower];
+}
+
+/// "已参与" that is really the joined badge, not a participant counter. The old
+/// -firstViewWithTextContaining:@"已参与" matched "1234人已参与" on the panel and
+/// made the engine report 已参与，等待开奖 for a bag it had never joined.
+- (DYViewHit *)joinedIndicatorView {
+    NSArray<DYViewHit *> *hits = [DYViewDetector findViewsWithTextContaining:@[ @"已参与" ]];
+    for (DYViewHit *hit in hits) {
+        NSString *t = hit.text ?: @"";
+        if ([t rangeOfString:@"人已参与"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"参与人数"].location != NSNotFound) continue;
+        if (t.length > 12) continue;   // "已有 1234 人已参与" style lines
+        return hit;
+    }
+    return nil;
+}
+
+/// Same counter filtering for the OCR side.
+- (BOOL)joinedIndicatorInHits:(NSArray<DYTextHit *> *)hits {
+    for (DYTextHit *h in [hits dy_hitsContaining:@"已参与"]) {
+        NSString *t = h.text ?: @"";
+        if ([t rangeOfString:@"人已参与"].location != NSNotFound) continue;
+        if ([t rangeOfString:@"参与人数"].location != NSNotFound) continue;
+        if (t.length > 12) continue;
+        return YES;
+    }
+    return NO;
+}
+
+/// Opens the bag panel by tapping the collapsed floating entry. This fixes BOTH
+/// reported symptoms:
+///
+///  1. "只要福袋是显示倒计时的就识别不到" — during the countdown the entry reads
+///     "距开抢 mm:ss" and there is no 参与 text anywhere, so the engine had nothing
+///     to act on and just logged 未找到参与按钮 until the user opened the panel by
+///     hand. Now we open it ourselves and the next pass reads the real button.
+///
+///  2. "福袋并未成功参与" — the entry ALSO cycles through 待参与, and older builds
+///     tapped that, counted a join, and immediately ran the comment flow against a
+///     screen with no comment box (=> phantom 已参与（无评论框）). Tapping the entry
+///     is now classified for what it is: opening the panel, not joining.
+///
+/// The tap has its own 12s cooldown (kBagEntryCooldown): the entry TOGGLES the
+/// panel, so re-tapping on every 1.5s pass would flicker it open and shut.
+- (void)openBagPanelFromHits:(NSArray<DYTextHit *> *)hits
+                      bagHit:(DYTextHit *)bagHit
+                   countdown:(BOOL)countdown
+                       entry:(DYViewHit *)entryFromJoinScan {
+    self.state = DYEngineStateBagDetected;
+
+    if ([DYConfig shared].patrolMode == DYPatrolModeDetectOnly) {
+        NSString *s = countdown ? @"[仅检测] 福袋倒计时中（未打开面板）"
+                                : @"[仅检测] 检测到福袋入口（未打开面板）";
+        [self updateStatus:s];
+        return;
+    }
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastEntryTapTime < kBagEntryCooldown) {
+        NSString *s = countdown ? @"福袋倒计时中，等待开抢" : @"正在打开福袋面板…";
+        [self updateStatus:s];
+        DYLog(@"bag entry: tapped %.1fs ago — waiting (cooldown %.0fs, countdown=%d)",
+              now - self.lastEntryTapTime, kBagEntryCooldown, countdown);
+        return;
+    }
+    // Give up auto-opening after a few taps. The entry is a toggle, so a tap that
+    // the panel has since masked (or one whose success OCR cannot confirm) would
+    // otherwise re-fire every 12s and flicker the panel open/closed forever. Past
+    // the cap we surface it and let the user open it by hand.
+    if (self.bagEntryOpenAttempts >= 3) {
+        [self updateStatus:@"福袋入口点击多次未打开面板，请手动打开面板参与"];
+        DYLog(@"bag entry: %ld open attempts exhausted — leaving panel to the user "
+              @"(countdown=%d)", (long)self.bagEntryOpenAttempts, countdown);
+        return;
+    }
+    if (self.panelOpenedByUs) {
+        // We tapped the entry a full cooldown ago and the panel still is not up.
+        DYLog(@"bag entry: previous tap did not open the panel — retrying");
+    }
+
+    // -joinViewWithPanelUp:NO already restricted the candidate to the upper area
+    // where the entry floats, so it is safe to tap directly. Fall back to the 福袋
+    // text node, then to the OCR rect for a Lynx bitmap entry with no text node.
+    DYViewHit *entry = entryFromJoinScan ?: [self bagEntryView];
+    DYTextHit *entryOCR = [self bagEntryHitFromHits:hits] ?: [self countdownEntryHitFromHits:hits];
+    BOOL dispatched = NO;
+    if (entry && entry.view && entry.view.window != nil) {
+        DYLog(@"bag entry: opening panel via view tree '%@' (countdown=%d)",
+              entry.text, countdown);
+        dispatched = [[DYTouch shared] tapView:entry.view];
+    } else if (entryOCR) {
+        DYLog(@"bag entry: opening panel via OCR rect '%@' at (%.0f,%.0f) (countdown=%d)",
+              entryOCR.text, CGRectGetMidX(entryOCR.rect), CGRectGetMidY(entryOCR.rect), countdown);
+        dispatched = [[DYTouch shared] tapInRect:entryOCR.rect];
+    } else {
+        DYLog(@"bag entry: no tappable entry found (neither view tree nor OCR; "
+              @"ocrBag='%@')", bagHit.text ?: @"(none)");
+    }
+
+    if (dispatched) {
+        self.lastEntryTapTime = now;
+        self.panelOpenedByUs = YES;
+        self.bagEntryOpenAttempts += 1;
+        NSString *s = countdown ? @"福袋倒计时中，已打开面板待开抢"
+                                : @"已打开福袋面板，寻找参与按钮";
+        [self updateStatus:s];
+    } else {
+        NSString *s = countdown ? @"福袋倒计时中，入口点击失败"
+                                : @"检测到福袋，入口点击失败";
+        [self updateStatus:s];
+    }
+}
+
+/// The panel is open but has no 参与 button. For a 评论福袋 / 超级福袋 that is the
+/// normal shape: participation IS posting the comment, and the panel only offers
+/// the comment box or the 一键发表评论 button. Older builds returned
+/// 检测到福袋，未找到参与按钮 here and never posted anything.
+///
+/// `countdown` matters: while the panel still reads 距开抢 mm:ss the bag has not
+/// opened yet and nothing can be posted, so a comment chain fired now would burn
+/// its 6 attempts against a dead panel and log a phantom result. During a countdown
+/// we therefore require a REAL affordance (the one-tap button or an actual input
+/// field) and otherwise just wait for the flip.
+///
+/// Rate-limited either way: -handleHits runs every 1.5s while -attemptCommentSend:
+/// retries for ~5s, so an unguarded call would stack overlapping chains.
+- (void)runCommentFlowOnOpenPanelDuringCountdown:(BOOL)countdown {
+    self.state = DYEngineStateBagDetected;
+
+    if ([DYConfig shared].patrolMode == DYPatrolModeDetectOnly) {
+        [self updateStatus:@"[仅检测] 福袋面板已打开（无参与按钮）"];
+        return;
+    }
+    if (![DYConfig shared].commentKeywordAutoSend) {
+        [self updateStatus:@"福袋面板已打开，未开启自动评论"];
+        return;
+    }
+
+    // A button/box we can actually act on right now. The room's own "说点什么"
+    // placeholder is NOT a real, focused input — qualifying it would let the
+    // comment flow fire into the live-room chat during a countdown. Require either
+    // the one-tap button or an input that is genuinely live (focused, or already
+    // holding text from a popped 口令 sheet).
+    BOOL oneClick = [DYViewDetector firstViewWithTextContaining:kWordOneClickComment] != nil;
+    DYViewHit *input = [DYViewDetector firstInputField];
+    BOOL realInput = (input != nil) && (input.view.isFirstResponder || input.text.length > 0);
+    BOOL actionable = oneClick || realInput;
+    if (countdown && !actionable) {
+        // Pre-open bag: panel is up, participation is not live yet. Sit on it —
+        // the next pass will see the 参与 button the moment Douyin enables it.
+        [self updateStatus:@"福袋面板已打开，倒计时中待开抢"];
+        DYLog(@"panel open during countdown with no actionable comment affordance "
+              @"— waiting for the bag to open");
+        return;
+    }
+
+    BOOL hasCommentContext = actionable
+                          || self.superBagActive
+                          || self.superBagComment.length > 0
+                          || self.lastKeyword.length > 0;
+    if (!hasCommentContext) {
+        [self updateStatus:@"检测到福袋，未找到参与按钮"];
+        return;
+    }
+
+    CFTimeInterval now = CACurrentMediaTime();
+    // One chain per bag-panel window. kCommentMaxAttempts x 0.8s = 4.8s, so 8s
+    // guarantees the previous chain has finished before a new one may start.
+    if (now - self.lastCommentChainTime < 8.0) {
+        DYLog(@"panel comment flow: chain started %.1fs ago — skipping",
+              now - self.lastCommentChainTime);
+        return;
+    }
+    self.lastCommentChainTime = now;
+    DYLog(@"panel open with no 参与 button — running the comment flow directly "
+          @"(superBag=%d countdown=%d comment='%@')",
+          self.superBagActive, countdown, self.superBagComment);
+    [self updateStatus:@"福袋面板已打开，正在发送评论参与"];
+    // lastTapPoint is only used by the fallback verify; point it at the panel so a
+    // stale coordinate from a previous bag cannot be re-verified.
+    [self sendCommentWithKeyword:self.lastKeyword tapPoint:self.lastTapPoint];
+    self.lastKeyword = nil;
 }
 
 /// Filters the view-tree 参与 hit the same way joinButtonHitFromHits filters
